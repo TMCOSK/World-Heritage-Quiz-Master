@@ -1,0 +1,5 @@
+{
+  "name": "World Heritage Quiz Master",
+  "description": "A comprehensive tool to generate, manage, and play World Heritage Certification quizzes using Gemini AI. Supports CSV export/import for massive datasets.",
+  "requestFramePermissions": []
+}
