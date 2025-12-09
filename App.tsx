@@ -5,7 +5,18 @@ import { parseCSV, toCSV, downloadCSV, CSV_HEADER, isDuplicate, shuffleArray } f
 
 // --- Constants ---
 const DEFAULT_SESSION_COUNT = 10;
-const MAX_QUESTIONS_PER_LEVEL = 2000; // Increased limit for heavy users
+const MAX_QUESTIONS_PER_LEVEL = 2000;
+
+// Target goals per level as requested
+const LEVEL_TARGETS: Record<string, number> = {
+  [QuizLevel.LEVEL_3]: 300,
+  [QuizLevel.LEVEL_2]: 600,
+  [QuizLevel.LEVEL_PRE_1]: 1000,
+  [QuizLevel.LEVEL_1]: 1000,
+};
+
+// Helper for delay
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 // --- Components ---
 
@@ -53,11 +64,15 @@ export default function App() {
   const [sessionType, setSessionType] = useState<'new' | 'review'>('new');
   
   const [view, setView] = useState<'home' | 'play' | 'manage' | 'settings'>('home');
+  
+  // Generation States
   const [isGenerating, setIsGenerating] = useState(false);
   const [loadingLevel, setLoadingLevel] = useState<QuizLevel | null>(null);
-  
-  // Generation Settings
   const [genCount, setGenCount] = useState(10);
+  
+  // Auto Generation States
+  const stopAutoRef = useRef(false);
+  const [autoProgress, setAutoProgress] = useState<{ level: QuizLevel, current: number, target: number } | null>(null);
 
   // Play State
   const [currentQIndex, setCurrentQIndex] = useState(0);
@@ -97,36 +112,29 @@ export default function App() {
     setView('home');
   };
 
-  // Mode A: Generate New Questions & Play
-  const handleGenerateLevel = async (level: QuizLevel) => {
-    if (isGenerating) return;
-
+  const checkApiKey = () => {
     if (!apiKey) {
       if (window.confirm("問題を作成するにはGemini APIキーが必要です。\n設定画面でキーを入力しますか？")) {
         setView('settings');
       }
-      return;
+      return false;
     }
+    return true;
+  };
+
+  // Mode A: Single Batch Generation
+  const handleGenerateLevel = async (level: QuizLevel) => {
+    if (isGenerating || !checkApiKey()) return;
 
     setIsGenerating(true);
     setLoadingLevel(level);
     setIsConfirmingExit(false);
 
     try {
-      // 1. Generate new questions
       const config: GeneratorConfig = { level, count: genCount };
-      // Pass the user's API Key
       const newItems = await generateQuizBatch(config, apiKey);
       
-      // 2. Setup Session (We play the NEWLY generated questions)
-      setSessionItems(newItems);
-      setSessionType('new');
-      setScore(0);
-      setCurrentQIndex(0);
-      setSelectedOption(null);
-      setShowResult(false);
-
-      // 3. Accumulate to DB (Background)
+      // Update DB
       setDbItems(prevDb => {
         const uniqueNewItems = newItems.filter(newItem => !isDuplicate(newItem.question, prevDb));
         const levelItems = prevDb.filter(i => i.level === level);
@@ -140,36 +148,122 @@ export default function App() {
         return [...otherItems, ...mergedLevelItems];
       });
 
+      // Start Session
+      setSessionItems(newItems);
+      setSessionType('new');
+      setScore(0);
+      setCurrentQIndex(0);
+      setSelectedOption(null);
+      setShowResult(false);
       setView('play');
 
     } catch (e: any) {
       console.error(e);
-      let msg = "問題の生成に失敗しました。";
-      if (e.message?.includes('API Key')) msg += "\nAPIキーが正しいか確認してください。";
-      else if (e.status === 429) msg += "\nリクエストが多すぎます。少し待ってから試してください。";
-      else msg += "\n" + (e.message || "Unknown error");
-      alert(msg);
+      alert("生成エラー: " + (e.message || "Unknown error"));
     } finally {
       setIsGenerating(false);
       setLoadingLevel(null);
     }
   };
 
-  // Mode B: Review Past Questions
-  const handleReviewLevel = (level: QuizLevel) => {
-    const levelItems = dbItems.filter(i => i.level === level);
+  // Mode B: Auto-Fill Generation (Loop)
+  const handleAutoGenerate = async (level: QuizLevel) => {
+    if (isGenerating || !checkApiKey()) return;
     
-    if (levelItems.length === 0) {
-      alert("まだ保存された問題がありません。「AI生成」で問題を作成してください。");
+    const target = LEVEL_TARGETS[level] || 300;
+    const currentCount = dbItems.filter(i => i.level === level).length;
+
+    if (currentCount >= target) {
+      alert(`すでに目標の${target}問に達しています！`);
       return;
     }
 
-    setIsConfirmingExit(false);
-    
-    // Shuffle and pick
+    if (!window.confirm(`${level}の目標は${target}問です。\n現在${currentCount}問あります。\n\nAIが目標に達するまで連続で生成を開始しますか？\n（途中で「停止」ボタンを押せます）`)) {
+      return;
+    }
+
+    setIsGenerating(true);
+    setLoadingLevel(level);
+    stopAutoRef.current = false;
+    setAutoProgress({ level, current: currentCount, target });
+
+    try {
+      // Loop until target reached or stopped
+      let loopCount = currentCount;
+      const batchSize = 20; // Fixed efficient batch size for auto mode
+
+      while (loopCount < target && !stopAutoRef.current) {
+        // Generate
+        const config: GeneratorConfig = { level, count: batchSize };
+        // We catch errors inside loop to allow retry or graceful stop
+        try {
+          const newItems = await generateQuizBatch(config, apiKey);
+          
+          // Update DB immediately
+          let addedCount = 0;
+          setDbItems(prevDb => {
+             const uniqueNewItems = newItems.filter(newItem => !isDuplicate(newItem.question, prevDb));
+             addedCount = uniqueNewItems.length;
+             
+             const levelItems = prevDb.filter(i => i.level === level);
+             const otherItems = prevDb.filter(i => i.level !== level);
+             let mergedLevelItems = [...levelItems, ...uniqueNewItems];
+             
+             // Keep only max limit
+             if (mergedLevelItems.length > MAX_QUESTIONS_PER_LEVEL) {
+               mergedLevelItems = mergedLevelItems.slice(mergedLevelItems.length - MAX_QUESTIONS_PER_LEVEL);
+             }
+             return [...otherItems, ...mergedLevelItems];
+          });
+
+          // If mostly duplicates returned, maybe change topic or just wait
+          if (addedCount === 0) {
+            console.log("No new unique questions generated in this batch. Retrying...");
+          }
+          
+          loopCount += addedCount;
+          // Update current count based on actual DB state for accuracy next tick
+          // But here we use loopCount for UI progress
+          setAutoProgress({ level, current: loopCount, target });
+
+        } catch (err: any) {
+           console.error("Auto-gen batch failed", err);
+           // Wait a bit longer on error
+           await sleep(5000);
+           if (stopAutoRef.current) break;
+           continue; 
+        }
+
+        // Wait between batches to respect rate limits
+        if (loopCount < target && !stopAutoRef.current) {
+          await sleep(2000); 
+        }
+      }
+      
+      alert(`生成完了！\n現在の問題数: ${loopCount}問`);
+
+    } catch (e: any) {
+      alert("自動生成中にエラーが発生しました: " + e.message);
+    } finally {
+      setIsGenerating(false);
+      setLoadingLevel(null);
+      setAutoProgress(null);
+    }
+  };
+
+  const handleStopAuto = () => {
+    stopAutoRef.current = true;
+  };
+
+  // Mode C: Review
+  const handleReviewLevel = (level: QuizLevel) => {
+    const levelItems = dbItems.filter(i => i.level === level);
+    if (levelItems.length === 0) {
+      alert("まだ保存された問題がありません。");
+      return;
+    }
     const shuffled = shuffleArray(levelItems);
     const selected = shuffled.slice(0, DEFAULT_SESSION_COUNT);
-
     setSessionItems(selected);
     setSessionType('review');
     setScore(0);
@@ -179,6 +273,7 @@ export default function App() {
     setView('play');
   };
 
+  // --- Quiz Interaction Helpers ---
   const handleAnswer = (idx: number) => {
     if (showResult) return;
     setSelectedOption(idx);
@@ -195,31 +290,12 @@ export default function App() {
       setShowResult(false);
       setIsConfirmingExit(false);
     } else {
-      // End of quiz session
       alert(`お疲れ様でした！\n今回のスコア: ${score} / ${sessionItems.length}`);
       setView('home');
     }
   };
 
-  const handleShare = async () => {
-    if (navigator.share) {
-      try {
-        await navigator.share({
-          title: 'AI世界遺産検定マスター',
-          text: 'AIが生成する問題で世界遺産検定の勉強をしよう！',
-          url: window.location.href,
-        });
-      } catch (error) {
-        console.log('Error sharing:', error);
-      }
-    } else {
-      navigator.clipboard.writeText(window.location.href);
-      alert('URLをコピーしました！');
-    }
-  };
-
-  // --- Data Management ---
-
+  // --- CSV Helpers ---
   const handleImportCSV = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
@@ -227,17 +303,12 @@ export default function App() {
       reader.onload = (evt) => {
         const text = evt.target?.result as string;
         const parsed = parseCSV(text);
-        
         // eslint-disable-next-line no-restricted-globals
-        const shouldMerge = dbItems.length > 0 && confirm("現在のリストに追加しますか？\n（キャンセルを押すと、現在のリストを削除して上書きします）");
-        
-        if (shouldMerge) {
-           const uniqueParsed = parsed.filter(newItem => !isDuplicate(newItem.question, dbItems));
-           setDbItems(prev => [...prev, ...uniqueParsed]);
-           alert(`${uniqueParsed.length}問を追加しました。（重複除外: ${parsed.length - uniqueParsed.length}件）`);
+        if (confirm(`${parsed.length}問を読み込みます。既存リストに追加しますか？\n(キャンセルで上書き)`)) {
+           const unique = parsed.filter(n => !isDuplicate(n.question, dbItems));
+           setDbItems(prev => [...prev, ...unique]);
         } else {
            setDbItems(parsed);
-           alert(`${parsed.length}問を読み込みました。`);
         }
       };
       reader.readAsText(file);
@@ -246,10 +317,34 @@ export default function App() {
 
   const handleExportCSV = () => {
     const csv = toCSV(dbItems);
-    downloadCSV(csv, `world_heritage_quiz_master_${new Date().toISOString().slice(0, 10)}.csv`);
+    downloadCSV(csv, `world_heritage_quiz_${new Date().toISOString().slice(0, 10)}.csv`);
   };
 
-  // --- Views ---
+  const handleShare = async () => {
+    const shareData = {
+      title: 'AI World Heritage Quiz',
+      text: 'Check out this AI-powered World Heritage quiz!',
+      url: window.location.href,
+    };
+
+    if (navigator.share) {
+      try {
+        await navigator.share(shareData);
+      } catch (err) {
+        console.error('Error sharing:', err);
+      }
+    } else {
+      try {
+        await navigator.clipboard.writeText(window.location.href);
+        alert('URLをコピーしました！');
+      } catch (err) {
+        console.error('Failed to copy:', err);
+        alert('URLのコピーに失敗しました');
+      }
+    }
+  };
+
+  // --- Renderers ---
 
   const renderHome = () => (
     <div className="flex flex-col items-center min-h-[60vh] space-y-8 animate-fade-in px-4 pb-12">
@@ -258,26 +353,24 @@ export default function App() {
           <span className="text-blue-600">AI</span> 世界遺産検定
         </h1>
         <p className="text-slate-500 text-sm md:text-base max-w-lg mx-auto leading-relaxed">
-          「AI生成」で新しい問題に挑戦し、ライブラリを充実させましょう。<br/>
-          「過去問」で保存済み問題からランダムに復習できます。
+          AIで問題集を作成し、CSVで出力・管理できます。<br/>
+          目標の問題数まで自動生成する機能を追加しました。
         </p>
       </div>
 
-      {/* Generation Settings */}
+      {/* Manual Gen Settings */}
       <div className="bg-white px-6 py-3 rounded-full shadow-sm border border-slate-200 flex items-center gap-3">
-        <span className="text-sm font-bold text-slate-600">一度に作成する問題数:</span>
+        <span className="text-sm font-bold text-slate-600">手動生成数:</span>
         <div className="flex gap-2">
           {[10, 20, 30].map(count => (
             <button
               key={count}
               onClick={() => setGenCount(count)}
               className={`px-3 py-1 rounded-full text-sm font-bold transition-all ${
-                genCount === count 
-                  ? 'bg-blue-600 text-white shadow-md' 
-                  : 'bg-slate-100 text-slate-500 hover:bg-slate-200'
+                genCount === count ? 'bg-blue-600 text-white shadow-md' : 'bg-slate-100 text-slate-500'
               }`}
             >
-              {count}問
+              {count}
             </button>
           ))}
         </div>
@@ -286,7 +379,9 @@ export default function App() {
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6 w-full max-w-4xl">
         {Object.values(QuizLevel).map((level) => {
           const savedCount = dbItems.filter(i => i.level === level).length;
-          const isLoadingThis = isGenerating && loadingLevel === level;
+          const target = LEVEL_TARGETS[level] || 300;
+          const isThisLoading = isGenerating && loadingLevel === level;
+          const isThisAuto = isThisLoading && autoProgress?.level === level;
           const isOtherLoading = isGenerating && loadingLevel !== level;
 
           return (
@@ -294,47 +389,83 @@ export default function App() {
               key={level}
               className={`
                 relative bg-white p-6 rounded-2xl shadow-sm border border-slate-200 transition-all duration-300
-                ${isOtherLoading ? 'opacity-50 grayscale' : 'hover:shadow-md hover:border-blue-200'}
+                ${isOtherLoading ? 'opacity-50 grayscale pointer-events-none' : 'hover:shadow-md hover:border-blue-200'}
               `}
             >
-              {isLoadingThis && (
-                 <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/90 rounded-2xl z-20">
-                   <svg className="animate-spin h-8 w-8 text-blue-600 mb-2" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                   </svg>
-                   <span className="text-sm font-bold text-blue-600 animate-pulse">生成中...</span>
+              {isThisLoading && (
+                 <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/95 rounded-2xl z-20 p-6 text-center">
+                   {isThisAuto ? (
+                     <>
+                        <div className="w-16 h-16 relative flex items-center justify-center mb-4">
+                           <svg className="animate-spin w-full h-full text-blue-200" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" fill="none"/></svg>
+                           <svg className="animate-spin w-full h-full text-blue-600 absolute top-0 left-0" viewBox="0 0 24 24" style={{animationDirection:'reverse', animationDuration:'3s'}}><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" fill="none"/></svg>
+                        </div>
+                        <p className="text-lg font-bold text-slate-800 mb-1">自動生成中...</p>
+                        <p className="text-2xl font-mono font-black text-blue-600 mb-2">
+                          {autoProgress?.current} <span className="text-sm text-slate-400">/ {autoProgress?.target}</span>
+                        </p>
+                        <p className="text-xs text-slate-500 mb-4 animate-pulse">AIが休憩しながら執筆しています</p>
+                        <Button variant="danger" onClick={handleStopAuto} className="py-2 px-6 text-sm">停止</Button>
+                     </>
+                   ) : (
+                     <>
+                       <svg className="animate-spin h-8 w-8 text-blue-600 mb-2" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                       <span className="text-sm font-bold text-blue-600">生成中...</span>
+                     </>
+                   )}
                  </div>
               )}
 
               <div className="flex justify-between items-start mb-4 border-b border-slate-100 pb-3">
-                <h3 className="text-2xl font-black text-slate-800 tracking-tight">{level}</h3>
+                <div>
+                  <h3 className="text-2xl font-black text-slate-800 tracking-tight">{level}</h3>
+                  <div className="text-xs font-bold text-slate-400 mt-1">目標: {target}問</div>
+                </div>
                 <div className="text-right">
                   <span className="block text-xs text-slate-400 font-bold uppercase tracking-wider">Saved</span>
-                  <span className="text-lg font-bold text-slate-600">{savedCount}</span>
+                  <span className={`text-xl font-bold ${savedCount >= target ? 'text-emerald-500' : 'text-slate-600'}`}>
+                    {savedCount}
+                  </span>
                   <span className="text-xs text-slate-400">問</span>
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
-                <Button 
-                  onClick={() => handleGenerateLevel(level)} 
-                  disabled={isGenerating}
-                  className="flex flex-col items-center justify-center py-4 text-sm"
-                >
-                  <span className="text-xl mb-1">🤖</span>
-                  <span>AI生成</span>
-                </Button>
+              {/* Progress Bar */}
+              <div className="w-full bg-slate-100 h-2 rounded-full mb-4 overflow-hidden">
+                <div 
+                  className={`h-full rounded-full transition-all duration-500 ${savedCount >= target ? 'bg-emerald-500' : 'bg-blue-500'}`} 
+                  style={{ width: `${Math.min(100, (savedCount / target) * 100)}%` }} 
+                />
+              </div>
 
-                <Button 
-                  onClick={() => handleReviewLevel(level)} 
-                  disabled={isGenerating || savedCount === 0}
-                  variant="success"
-                  className="flex flex-col items-center justify-center py-4 text-sm"
-                >
-                  <span className="text-xl mb-1">📚</span>
-                  <span>過去問</span>
-                </Button>
+              <div className="space-y-3">
+                <div className="grid grid-cols-2 gap-3">
+                  <Button 
+                    onClick={() => handleGenerateLevel(level)} 
+                    disabled={isGenerating}
+                    className="flex flex-col items-center justify-center py-3 text-sm"
+                  >
+                    <span>⚡️ 1回生成</span>
+                  </Button>
+                  <Button 
+                    onClick={() => handleReviewLevel(level)} 
+                    disabled={isGenerating || savedCount === 0}
+                    variant="success"
+                    className="flex flex-col items-center justify-center py-3 text-sm"
+                  >
+                    <span>📚 過去問</span>
+                  </Button>
+                </div>
+
+                {savedCount < target && (
+                  <button
+                    onClick={() => handleAutoGenerate(level)}
+                    disabled={isGenerating}
+                    className="w-full bg-indigo-50 hover:bg-indigo-100 text-indigo-600 border border-indigo-200 font-bold py-3 rounded-xl text-sm transition-colors flex items-center justify-center gap-2"
+                  >
+                    <span>🤖 目標({target}問)まで自動生成</span>
+                  </button>
+                )}
               </div>
             </div>
           );
@@ -357,7 +488,6 @@ export default function App() {
        <h2 className="text-xl md:text-2xl font-bold mb-6 flex items-center gap-2">
         <span className="text-slate-600">⚙️</span> 設定
       </h2>
-
       <div className="space-y-6">
         <div>
           <label className="block text-sm font-bold text-slate-700 mb-2">Gemini API キー</label>
@@ -369,11 +499,10 @@ export default function App() {
             className="w-full p-4 rounded-xl border-2 border-slate-200 focus:border-blue-500 focus:outline-none font-mono text-sm"
           />
           <p className="text-xs text-slate-500 mt-2 leading-relaxed">
-            APIキーはブラウザにのみ保存され、外部に送信されることはありません。<br/>
-            まだお持ちでない方は <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" className="text-blue-500 underline">Google AI Studio</a> から無料で取得できます。
+             APIキーを入力してください。<br/>
+            <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" className="text-blue-500 underline">Google AI Studioで取得</a>
           </p>
         </div>
-
         <div className="flex gap-4 pt-4">
           <Button onClick={() => setView('home')} variant="secondary" className="flex-1">キャンセル</Button>
           <Button onClick={handleSaveApiKey} className="flex-1">保存する</Button>
@@ -387,24 +516,19 @@ export default function App() {
        <h2 className="text-xl md:text-2xl font-bold mb-6 flex items-center gap-2">
         <span className="text-emerald-600">📂</span> データ管理
       </h2>
-
       <div className="space-y-8">
         <section className="bg-slate-50 p-5 rounded-xl border border-slate-100">
           <h3 className="text-lg font-bold text-slate-800 mb-4 flex justify-between items-center">
             <span>ライブラリ状況</span>
-            <span className="text-xs font-normal text-slate-500 bg-white px-2 py-1 rounded border">上限: 各級{MAX_QUESTIONS_PER_LEVEL}問</span>
           </h3>
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
              {Object.values(QuizLevel).map(lvl => {
                const count = dbItems.filter(i => i.level === lvl).length;
-               const percent = Math.min(100, (count / MAX_QUESTIONS_PER_LEVEL) * 100);
+               const target = LEVEL_TARGETS[lvl] || 300;
                return (
                  <div key={lvl} className="bg-white p-3 rounded-lg border border-slate-200 shadow-sm">
                     <span className="text-xs text-slate-500 block mb-1">{lvl}</span>
-                    <span className="text-xl font-bold block mb-2">{count}問</span>
-                    <div className="w-full bg-slate-100 rounded-full h-1.5">
-                      <div className="bg-blue-500 h-1.5 rounded-full" style={{ width: `${percent}%` }}></div>
-                    </div>
+                    <span className="text-xl font-bold block mb-2">{count} / {target}</span>
                  </div>
                );
              })}
@@ -416,7 +540,6 @@ export default function App() {
              </Button>
           </div>
         </section>
-
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           <section>
             <h3 className="text-base font-bold text-slate-800 mb-3">CSV インポート</h3>
@@ -426,7 +549,6 @@ export default function App() {
               <span className="text-slate-600 font-bold text-sm">ファイルを選択</span>
             </label>
           </section>
-
           <section>
             <h3 className="text-base font-bold text-slate-800 mb-3">CSV エクスポート</h3>
             <button 
@@ -439,7 +561,6 @@ export default function App() {
             </button>
           </section>
         </div>
-
         <div className="pt-4 text-center">
           <Button onClick={() => setView('home')} variant="secondary" className="w-full md:w-auto min-w-[200px]">ホームに戻る</Button>
         </div>
