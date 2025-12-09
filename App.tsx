@@ -4,8 +4,8 @@ import { generateQuizBatch } from './geminiService';
 import { parseCSV, toCSV, downloadCSV, CSV_HEADER, isDuplicate, shuffleArray } from './utils';
 
 // --- Constants ---
-const SESSION_QUESTION_COUNT = 10; // Number of questions per quick play session
-const MAX_QUESTIONS_PER_LEVEL = 500; // Safety cap to prevent localStorage overflow (approx 2000 total)
+const DEFAULT_SESSION_COUNT = 10;
+const MAX_QUESTIONS_PER_LEVEL = 2000; // Increased limit for heavy users
 
 // --- Components ---
 
@@ -48,13 +48,16 @@ export default function App() {
   });
   const [tempKeyInput, setTempKeyInput] = useState('');
 
-  // Session: Current 10 questions being played
+  // Session: Current questions being played
   const [sessionItems, setSessionItems] = useState<QuizItem[]>([]);
   const [sessionType, setSessionType] = useState<'new' | 'review'>('new');
   
   const [view, setView] = useState<'home' | 'play' | 'manage' | 'settings'>('home');
   const [isGenerating, setIsGenerating] = useState(false);
   const [loadingLevel, setLoadingLevel] = useState<QuizLevel | null>(null);
+  
+  // Generation Settings
+  const [genCount, setGenCount] = useState(10);
 
   // Play State
   const [currentQIndex, setCurrentQIndex] = useState(0);
@@ -111,7 +114,7 @@ export default function App() {
 
     try {
       // 1. Generate new questions
-      const config: GeneratorConfig = { level, count: SESSION_QUESTION_COUNT };
+      const config: GeneratorConfig = { level, count: genCount };
       // Pass the user's API Key
       const newItems = await generateQuizBatch(config, apiKey);
       
@@ -144,6 +147,7 @@ export default function App() {
       let msg = "問題の生成に失敗しました。";
       if (e.message?.includes('API Key')) msg += "\nAPIキーが正しいか確認してください。";
       else if (e.status === 429) msg += "\nリクエストが多すぎます。少し待ってから試してください。";
+      else msg += "\n" + (e.message || "Unknown error");
       alert(msg);
     } finally {
       setIsGenerating(false);
@@ -162,9 +166,9 @@ export default function App() {
 
     setIsConfirmingExit(false);
     
-    // Shuffle and pick 10 (or less if not enough)
+    // Shuffle and pick
     const shuffled = shuffleArray(levelItems);
-    const selected = shuffled.slice(0, SESSION_QUESTION_COUNT);
+    const selected = shuffled.slice(0, DEFAULT_SESSION_COUNT);
 
     setSessionItems(selected);
     setSessionType('review');
@@ -209,7 +213,6 @@ export default function App() {
         console.log('Error sharing:', error);
       }
     } else {
-      // Fallback for desktop browsers that don't support share
       navigator.clipboard.writeText(window.location.href);
       alert('URLをコピーしました！');
     }
@@ -258,6 +261,26 @@ export default function App() {
           「AI生成」で新しい問題に挑戦し、ライブラリを充実させましょう。<br/>
           「過去問」で保存済み問題からランダムに復習できます。
         </p>
+      </div>
+
+      {/* Generation Settings */}
+      <div className="bg-white px-6 py-3 rounded-full shadow-sm border border-slate-200 flex items-center gap-3">
+        <span className="text-sm font-bold text-slate-600">一度に作成する問題数:</span>
+        <div className="flex gap-2">
+          {[10, 20, 30].map(count => (
+            <button
+              key={count}
+              onClick={() => setGenCount(count)}
+              className={`px-3 py-1 rounded-full text-sm font-bold transition-all ${
+                genCount === count 
+                  ? 'bg-blue-600 text-white shadow-md' 
+                  : 'bg-slate-100 text-slate-500 hover:bg-slate-200'
+              }`}
+            >
+              {count}問
+            </button>
+          ))}
+        </div>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6 w-full max-w-4xl">
