@@ -73,15 +73,31 @@ export const generateQuizBatch = async (config: GeneratorConfig, apiKey: string)
       config: {
         responseMimeType: "application/json",
         responseSchema: quizSchema,
-        temperature: 0.7, // Increased temperature for more variety
+        temperature: 0.7, 
       },
     });
 
     const text = response.text;
-    if (!text) return [];
+    if (!text) {
+      throw new Error("No content generated. The model might have been blocked by safety settings.");
+    }
 
-    const rawData = JSON.parse(text);
+    // Clean potential markdown formatting just in case
+    // Sometimes models wrap JSON in ```json ... ``` even when mimeType is application/json
+    const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
     
+    let rawData;
+    try {
+      rawData = JSON.parse(cleanText);
+    } catch (parseError) {
+      console.error("JSON Parse Error:", parseError, "Text:", text);
+      throw new Error("AI response was not valid JSON. Please try again.");
+    }
+    
+    if (!Array.isArray(rawData)) {
+      throw new Error("AI response format error: expected an array.");
+    }
+
     // Map to internal type with ID
     return rawData.map((item: any) => ({
       ...item,

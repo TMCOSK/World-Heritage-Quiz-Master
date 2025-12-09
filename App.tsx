@@ -72,7 +72,7 @@ export default function App() {
   
   // Auto Generation States
   const stopAutoRef = useRef(false);
-  const [autoProgress, setAutoProgress] = useState<{ level: QuizLevel, current: number, target: number } | null>(null);
+  const [autoProgress, setAutoProgress] = useState<{ level: QuizLevel, current: number, target: number, status: string } | null>(null);
 
   // Play State
   const [currentQIndex, setCurrentQIndex] = useState(0);
@@ -185,21 +185,25 @@ export default function App() {
     setIsGenerating(true);
     setLoadingLevel(level);
     stopAutoRef.current = false;
-    setAutoProgress({ level, current: currentCount, target });
+    // Initial status
+    setAutoProgress({ level, current: currentCount, target, status: '準備中...' });
 
     try {
-      // Loop until target reached or stopped
       let loopCount = currentCount;
-      const batchSize = 20; // Fixed efficient batch size for auto mode
+      const batchSize = 20; 
 
       while (loopCount < target && !stopAutoRef.current) {
-        // Generate
+        // Update Status
+        setAutoProgress({ level, current: loopCount, target, status: 'AIが問題を執筆中...' });
+        
         const config: GeneratorConfig = { level, count: batchSize };
-        // We catch errors inside loop to allow retry or graceful stop
+        
         try {
           const newItems = await generateQuizBatch(config, apiKey);
           
-          // Update DB immediately
+          // Saving Status
+          setAutoProgress({ level, current: loopCount, target, status: '保存中...' });
+
           let addedCount = 0;
           setDbItems(prevDb => {
              const uniqueNewItems = newItems.filter(newItem => !isDuplicate(newItem.question, prevDb));
@@ -209,33 +213,29 @@ export default function App() {
              const otherItems = prevDb.filter(i => i.level !== level);
              let mergedLevelItems = [...levelItems, ...uniqueNewItems];
              
-             // Keep only max limit
              if (mergedLevelItems.length > MAX_QUESTIONS_PER_LEVEL) {
                mergedLevelItems = mergedLevelItems.slice(mergedLevelItems.length - MAX_QUESTIONS_PER_LEVEL);
              }
              return [...otherItems, ...mergedLevelItems];
           });
 
-          // If mostly duplicates returned, maybe change topic or just wait
           if (addedCount === 0) {
-            console.log("No new unique questions generated in this batch. Retrying...");
+            console.log("No new unique questions generated. Retrying...");
           }
           
           loopCount += addedCount;
-          // Update current count based on actual DB state for accuracy next tick
-          // But here we use loopCount for UI progress
-          setAutoProgress({ level, current: loopCount, target });
+          // Updated count status
+          setAutoProgress({ level, current: loopCount, target, status: '完了！次のバッチへ...' });
 
         } catch (err: any) {
            console.error("Auto-gen batch failed", err);
-           // Wait a bit longer on error
            await sleep(5000);
            if (stopAutoRef.current) break;
            continue; 
         }
 
-        // Wait between batches to respect rate limits
         if (loopCount < target && !stopAutoRef.current) {
+          setAutoProgress({ level, current: loopCount, target, status: 'AI休憩中 (レート制限回避)...' });
           await sleep(2000); 
         }
       }
@@ -393,7 +393,7 @@ export default function App() {
               `}
             >
               {isThisLoading && (
-                 <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/95 rounded-2xl z-20 p-6 text-center">
+                 <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/95 rounded-2xl z-20 p-6 text-center shadow-inner">
                    {isThisAuto ? (
                      <>
                         <div className="w-16 h-16 relative flex items-center justify-center mb-4">
@@ -401,16 +401,17 @@ export default function App() {
                            <svg className="animate-spin w-full h-full text-blue-600 absolute top-0 left-0" viewBox="0 0 24 24" style={{animationDirection:'reverse', animationDuration:'3s'}}><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" fill="none"/></svg>
                         </div>
                         <p className="text-lg font-bold text-slate-800 mb-1">自動生成中...</p>
-                        <p className="text-2xl font-mono font-black text-blue-600 mb-2">
+                        <p className="text-sm font-medium text-slate-500 mb-2 h-6">{autoProgress?.status}</p>
+                        <p className="text-2xl font-mono font-black text-blue-600 mb-4">
                           {autoProgress?.current} <span className="text-sm text-slate-400">/ {autoProgress?.target}</span>
                         </p>
-                        <p className="text-xs text-slate-500 mb-4 animate-pulse">AIが休憩しながら執筆しています</p>
                         <Button variant="danger" onClick={handleStopAuto} className="py-2 px-6 text-sm">停止</Button>
                      </>
                    ) : (
                      <>
-                       <svg className="animate-spin h-8 w-8 text-blue-600 mb-2" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-                       <span className="text-sm font-bold text-blue-600">生成中...</span>
+                       <svg className="animate-spin h-8 w-8 text-blue-600 mb-3" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                       <span className="text-sm font-bold text-blue-600 animate-pulse">{genCount}問を作成しています...</span>
+                       <span className="text-xs text-slate-400 mt-2">（約5〜10秒かかります）</span>
                      </>
                    )}
                  </div>
@@ -445,7 +446,7 @@ export default function App() {
                     disabled={isGenerating}
                     className="flex flex-col items-center justify-center py-3 text-sm"
                   >
-                    <span>⚡️ 1回生成</span>
+                    <span>⚡️ {genCount}問 作成</span>
                   </Button>
                   <Button 
                     onClick={() => handleReviewLevel(level)} 
