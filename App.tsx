@@ -122,6 +122,22 @@ export default function App() {
     return true;
   };
 
+  const handleError = (e: any) => {
+    console.error(e);
+    let msg = e.message || "Unknown error";
+    
+    // Make error messages user friendly
+    if (msg.includes('503') || msg.includes('overloaded') || msg.includes('UNAVAILABLE')) {
+      msg = "アクセスが集中しており、AIモデルが応答しませんでした。\n時間を置いてから再試行してください。";
+    } else if (msg.includes('JSON')) {
+      msg = "AIデータの解析に失敗しました。もう一度試してみてください。";
+    } else if (msg.includes('API Key')) {
+      msg = "APIキーが無効か、設定されていません。";
+    }
+
+    alert("エラーが発生しました:\n" + msg);
+  };
+
   // Mode A: Single Batch Generation
   const handleGenerateLevel = async (level: QuizLevel) => {
     if (isGenerating || !checkApiKey()) return;
@@ -158,8 +174,7 @@ export default function App() {
       setView('play');
 
     } catch (e: any) {
-      console.error(e);
-      alert("生成エラー: " + (e.message || "Unknown error"));
+      handleError(e);
     } finally {
       setIsGenerating(false);
       setLoadingLevel(null);
@@ -229,9 +244,19 @@ export default function App() {
 
         } catch (err: any) {
            console.error("Auto-gen batch failed", err);
-           await sleep(5000);
-           if (stopAutoRef.current) break;
-           continue; 
+           // If it's the overload error, we might have already retried inside generateQuizBatch.
+           // If it bubble up here, we should probably pause longer or stop.
+           if (err.message?.includes('503') || err.message?.includes('overloaded')) {
+             setAutoProgress({ level, current: loopCount, target, status: '混雑中... 10秒待機します' });
+             await sleep(10000);
+             if (stopAutoRef.current) break;
+             continue; 
+           } else {
+             // For other errors, just pause a bit
+             await sleep(5000);
+             if (stopAutoRef.current) break;
+             continue; 
+           }
         }
 
         if (loopCount < target && !stopAutoRef.current) {
@@ -243,7 +268,7 @@ export default function App() {
       alert(`生成完了！\n現在の問題数: ${loopCount}問`);
 
     } catch (e: any) {
-      alert("自動生成中にエラーが発生しました: " + e.message);
+      handleError(e);
     } finally {
       setIsGenerating(false);
       setLoadingLevel(null);

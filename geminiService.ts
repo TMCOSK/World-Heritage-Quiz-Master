@@ -39,13 +39,16 @@ const getRandomTheme = () => {
   return RANDOM_THEMES[idx];
 };
 
+// Helper for delay
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 export const generateQuizBatch = async (config: GeneratorConfig, apiKey: string): Promise<QuizItem[]> => {
   if (!apiKey) {
     throw new Error("API Key is missing.");
   }
 
   const ai = new GoogleGenAI({ apiKey });
-  const model = "gemini-2.5-flash"; // Efficient for batch generation
+  const model = "gemini-2.5-flash"; 
 
   // If user didn't specify a topic, inject a random one to ensure variety
   const autoTopic = config.focusTopic ? config.focusTopic : getRandomTheme();
@@ -66,46 +69,77 @@ export const generateQuizBatch = async (config: GeneratorConfig, apiKey: string)
     - Ensure questions are unique and not generic "What is a World Heritage site?" questions.
   `;
 
-  try {
-    const response = await ai.models.generateContent({
-      model,
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: quizSchema,
-        temperature: 0.7, 
-      },
-    });
+  let lastError: any = null;
+  const maxRetries = 3;
 
-    const text = response.text;
-    if (!text) {
-      throw new Error("No content generated. The model might have been blocked by safety settings.");
-    }
-
-    // Clean potential markdown formatting just in case
-    // Sometimes models wrap JSON in ```json ... ``` even when mimeType is application/json
-    const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
-    
-    let rawData;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      rawData = JSON.parse(cleanText);
-    } catch (parseError) {
-      console.error("JSON Parse Error:", parseError, "Text:", text);
-      throw new Error("AI response was not valid JSON. Please try again.");
-    }
-    
-    if (!Array.isArray(rawData)) {
-      throw new Error("AI response format error: expected an array.");
-    }
+      // Add delay on retries (Exponential backoff)
+      if (attempt > 0) {
+        const waitTime = Math.pow(2, attempt) * 1000 + Math.random() * 1000; // ~2s, 4s, 8s
+        console.log(`Retry attempt ${attempt}. Waiting ${Math.round(waitTime)}ms`);
+        await sleep(waitTime);
+      }
 
-    // Map to internal type with ID
-    return rawData.map((item: any) => ({
-      ...item,
-      id: generateId(),
-    }));
+      const response = await ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: quizSchema,
+          temperature: 0.7, 
+        },
+      });
 
-  } catch (error) {
-    console.error("Gemini Generation Error:", error);
-    throw error;
+      const text = response.text;
+      if (!text) {
+        throw new Error("No content generated.");
+      }
+
+      // Clean potential markdown formatting just in case
+      const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
+      
+      let rawData;
+      try {
+        rawData = JSON.parse(cleanText);
+      } catch (parseError) {
+        console.error("JSON Parse Error:", parseError, "Text:", text);
+        throw new Error("AI response was not valid JSON.");
+      }
+      
+      if (!Array.isArray(rawData)) {
+        throw new Error("AI response format error: expected an array.");
+      }
+
+      // Map to internal type with ID
+      return rawData.map((item: any) => ({
+        ...item,
+        id: generateId(),
+      }));
+
+    } catch (error: any) {
+      console.warn(`Gemini generation attempt ${attempt + 1} failed:`, error);
+      lastError = error;
+
+      // Check if error is retryable (503 Service Unavailable or 429 Too Many Requests)
+      const isRetryable = 
+        error.message?.includes('503') || 
+        error.message?.includes('overloaded') ||
+        error.status === 503 ||
+        error.code === 503 ||
+        error.status === 429;
+
+      if (isRetryable && attempt < maxRetries) {
+        continue; // Try again
+      }
+      
+      // If it's a non-recoverable error, break immediately
+      if (!isRetryable) {
+         break;
+      }
+    }
   }
+
+  // If we get here, all retries failed
+  throw lastError || new Error("Failed to generate quiz questions after multiple attempts.");
 };
