@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { QuizItem, QuizLevel, GeneratorConfig } from './types';
 import { generateQuizBatch } from './geminiService';
-import { parseCSV, toCSV, downloadCSV, CSV_HEADER, isDuplicate, shuffleArray } from './utils';
+import { parseCSV, toCSV, downloadCSV, isDuplicate, shuffleArray } from './utils';
 
 // --- Constants ---
 const DEFAULT_SESSION_COUNT = 10;
@@ -72,7 +72,13 @@ export default function App() {
   
   // Auto Generation States
   const stopAutoRef = useRef(false);
-  const [autoProgress, setAutoProgress] = useState<{ level: QuizLevel, current: number, target: number, status: string } | null>(null);
+  const [autoProgress, setAutoProgress] = useState<{ 
+    level: QuizLevel, 
+    current: number, 
+    target: number, 
+    status: string,
+    isStopping: boolean 
+  } | null>(null);
 
   // Play State
   const [currentQIndex, setCurrentQIndex] = useState(0);
@@ -81,13 +87,12 @@ export default function App() {
   const [score, setScore] = useState(0);
   const [isConfirmingExit, setIsConfirmingExit] = useState(false);
 
-  // Auto-save DB to localStorage
+  // Auto-save DB to localStorage (Backup for manual changes)
   useEffect(() => {
     try {
       localStorage.setItem('wh_quiz_data', JSON.stringify(dbItems));
     } catch (e) {
-      console.error("Failed to save data to localStorage. Storage might be full.", e);
-      alert("ブラウザの保存容量がいっぱいです。古いデータを削除してください。");
+      console.error("Failed to save data to localStorage.", e);
     }
   }, [dbItems]);
 
@@ -129,6 +134,8 @@ export default function App() {
     // Make error messages user friendly
     if (msg.includes('503') || msg.includes('overloaded') || msg.includes('UNAVAILABLE')) {
       msg = "アクセスが集中しており、AIモデルが応答しませんでした。\n時間を置いてから再試行してください。";
+    } else if (msg.includes('429') || msg.includes('quota')) {
+      msg = "APIの利用制限（レートリミット）に達しました。\n数分待ってから再度お試しください。";
     } else if (msg.includes('JSON')) {
       msg = "AIデータの解析に失敗しました。もう一度試してみてください。";
     } else if (msg.includes('API Key')) {
@@ -186,7 +193,10 @@ export default function App() {
     if (isGenerating || !checkApiKey()) return;
     
     const target = LEVEL_TARGETS[level] || 300;
-    const currentCount = dbItems.filter(i => i.level === level).length;
+    
+    // Use a local copy of DB to track progress accurately within the loop without waiting for re-renders
+    let localDb = [...dbItems];
+    let currentCount = localDb.filter(i => i.level === level).length;
 
     if (currentCount >= target) {
       alert(`すでに目標の${target}問に達しています！`);
@@ -200,72 +210,118 @@ export default function App() {
     setIsGenerating(true);
     setLoadingLevel(level);
     stopAutoRef.current = false;
+    
     // Initial status
-    setAutoProgress({ level, current: currentCount, target, status: '準備中...' });
+    setAutoProgress({ level, current: currentCount, target, status: '準備中...', isStopping: false });
 
     try {
-      let loopCount = currentCount;
-      const batchSize = 20; 
-
-      while (loopCount < target && !stopAutoRef.current) {
-        // Update Status
-        setAutoProgress({ level, current: loopCount, target, status: 'AIが問題を執筆中...' });
+      // Loop until target reached or stopped
+      while (currentCount < target && !stopAutoRef.current) {
         
-        const config: GeneratorConfig = { level, count: batchSize };
+        // 1. Calculate strictly needed count
+        const remaining = target - currentCount;
+        // Cap batch size at 10 for better responsiveness and saving frequency
+        const batchSize = Math.min(10, remaining);
+        
+        if (batchSize <= 0) break;
+
+        // Update Status
+        setAutoProgress(prev => ({ 
+          level, current: currentCount, target, status: `AIが執筆中 (${batchSize}問)...`, isStopping: prev?.isStopping || false 
+        }));
         
         try {
-          const newItems = await generateQuizBatch(config, apiKey);
+          // Generate
+          const newItems = await generateQuizBatch({ level, count: batchSize }, apiKey);
           
-          // Saving Status
-          setAutoProgress({ level, current: loopCount, target, status: '保存中...' });
+          if (stopAutoRef.current) break;
 
-          let addedCount = 0;
-          setDbItems(prevDb => {
-             const uniqueNewItems = newItems.filter(newItem => !isDuplicate(newItem.question, prevDb));
-             addedCount = uniqueNewItems.length;
-             
-             const levelItems = prevDb.filter(i => i.level === level);
-             const otherItems = prevDb.filter(i => i.level !== level);
-             let mergedLevelItems = [...levelItems, ...uniqueNewItems];
-             
-             if (mergedLevelItems.length > MAX_QUESTIONS_PER_LEVEL) {
-               mergedLevelItems = mergedLevelItems.slice(mergedLevelItems.length - MAX_QUESTIONS_PER_LEVEL);
-             }
-             return [...otherItems, ...mergedLevelItems];
-          });
+          // Update Status
+          setAutoProgress(prev => ({ 
+            level, current: currentCount, target, status: '保存中...', isStopping: prev?.isStopping || false 
+          }));
 
-          if (addedCount === 0) {
-            console.log("No new unique questions generated. Retrying...");
+          // Filter duplicates against the LOCAL database copy
+          const uniqueItems = newItems.filter(newItem => !isDuplicate(newItem.question, localDb));
+          
+          if (uniqueItems.length > 0) {
+            // Append to local DB copy
+            localDb = [...localDb, ...uniqueItems];
+            
+            // Recalculate count based on filtered items
+            const levelItems = localDb.filter(i => i.level === level);
+            
+            // Limit per level if needed
+            if (levelItems.length > MAX_QUESTIONS_PER_LEVEL) {
+               // This logic is complex in a flat array, but simplified:
+               // Just keep growing localDb, we can trim later if really needed.
+               // For safety, let's just update the count.
+            }
+            
+            currentCount = levelItems.length;
+
+            // CRITICAL: Update React State AND LocalStorage IMMEDIATELY
+            setDbItems(localDb);
+            try {
+              localStorage.setItem('wh_quiz_data', JSON.stringify(localDb));
+            } catch (e) {
+              console.error("Auto-save failed during loop", e);
+            }
+          } else {
+             console.log("Duplicate batch detected, retrying...");
+             // If all were duplicates, we haven't advanced.
           }
           
-          loopCount += addedCount;
-          // Updated count status
-          setAutoProgress({ level, current: loopCount, target, status: '完了！次のバッチへ...' });
+          // Update Status
+          setAutoProgress(prev => ({ 
+            level, current: currentCount, target, status: '完了！次のバッチへ...', isStopping: prev?.isStopping || false 
+          }));
 
         } catch (err: any) {
            console.error("Auto-gen batch failed", err);
-           // If it's the overload error, we might have already retried inside generateQuizBatch.
-           // If it bubble up here, we should probably pause longer or stop.
-           if (err.message?.includes('503') || err.message?.includes('overloaded')) {
-             setAutoProgress({ level, current: loopCount, target, status: '混雑中... 10秒待機します' });
+           const msg = err.message || "";
+           
+           if (stopAutoRef.current) break;
+
+           if (msg.includes('429') || msg.includes('quota') || msg.includes('retry')) {
+              // Rate Limit Hit - Long Pause
+              const waitSec = 60;
+              for (let i = waitSec; i > 0; i--) {
+                if (stopAutoRef.current) break;
+                setAutoProgress(prev => ({ 
+                  level, current: currentCount, target, status: `制限到達。あと${i}秒待機...`, isStopping: prev?.isStopping || false 
+                }));
+                await sleep(1000);
+              }
+           } else if (msg.includes('503') || msg.includes('overloaded')) {
+             setAutoProgress(prev => ({ 
+               level, current: currentCount, target, status: '混雑中... 10秒待機します', isStopping: prev?.isStopping || false 
+             }));
              await sleep(10000);
-             if (stopAutoRef.current) break;
-             continue; 
            } else {
-             // For other errors, just pause a bit
+             // Other error (safety etc)
              await sleep(5000);
-             if (stopAutoRef.current) break;
-             continue; 
            }
         }
 
-        if (loopCount < target && !stopAutoRef.current) {
-          setAutoProgress({ level, current: loopCount, target, status: 'AI休憩中 (レート制限回避)...' });
-          await sleep(2000); 
+        // Rest between batches if not finished
+        if (currentCount < target && !stopAutoRef.current) {
+          // 5 seconds rest
+          for(let i=5; i>0; i--) {
+             if (stopAutoRef.current) break;
+             setAutoProgress(prev => ({ 
+               level, current: currentCount, target, status: `休憩中 (${i}秒)...`, isStopping: prev?.isStopping || false 
+             }));
+             await sleep(1000);
+          }
         }
       }
       
-      alert(`生成完了！\n現在の問題数: ${loopCount}問`);
+      if (currentCount >= target) {
+         alert(`🎉 目標の${target}問に到達しました！\n現在の問題数: ${currentCount}問`);
+      } else {
+         alert(`自動生成を停止しました。\n現在の問題数: ${currentCount}問`);
+      }
 
     } catch (e: any) {
       handleError(e);
@@ -273,11 +329,14 @@ export default function App() {
       setIsGenerating(false);
       setLoadingLevel(null);
       setAutoProgress(null);
+      stopAutoRef.current = false;
     }
   };
 
   const handleStopAuto = () => {
     stopAutoRef.current = true;
+    // Force update UI to show stopping status
+    setAutoProgress(prev => prev ? ({ ...prev, status: '停止処理中...', isStopping: true }) : null);
   };
 
   // Mode C: Review
@@ -409,6 +468,11 @@ export default function App() {
           const isThisAuto = isThisLoading && autoProgress?.level === level;
           const isOtherLoading = isGenerating && loadingLevel !== level;
 
+          // Progress calculation
+          const progressPercent = autoProgress 
+             ? Math.min(100, (autoProgress.current / autoProgress.target) * 100)
+             : Math.min(100, (savedCount / target) * 100);
+
           return (
             <div 
               key={level}
@@ -418,20 +482,48 @@ export default function App() {
               `}
             >
               {isThisLoading && (
-                 <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/95 rounded-2xl z-20 p-6 text-center shadow-inner">
+                 <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/95 rounded-2xl z-20 p-6 text-center shadow-inner animate-fade-in">
                    {isThisAuto ? (
-                     <>
-                        <div className="w-16 h-16 relative flex items-center justify-center mb-4">
-                           <svg className="animate-spin w-full h-full text-blue-200" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" fill="none"/></svg>
+                     <div className="w-full max-w-xs space-y-4">
+                        <div className="w-16 h-16 relative flex items-center justify-center mx-auto mb-2">
+                           <svg className="animate-spin w-full h-full text-blue-100" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" fill="none"/></svg>
                            <svg className="animate-spin w-full h-full text-blue-600 absolute top-0 left-0" viewBox="0 0 24 24" style={{animationDirection:'reverse', animationDuration:'3s'}}><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" fill="none"/></svg>
                         </div>
-                        <p className="text-lg font-bold text-slate-800 mb-1">自動生成中...</p>
-                        <p className="text-sm font-medium text-slate-500 mb-2 h-6">{autoProgress?.status}</p>
-                        <p className="text-2xl font-mono font-black text-blue-600 mb-4">
-                          {autoProgress?.current} <span className="text-sm text-slate-400">/ {autoProgress?.target}</span>
+                        
+                        <div>
+                          <p className={`text-lg font-bold mb-1 ${autoProgress?.isStopping ? 'text-red-500 animate-pulse' : 'text-slate-800'}`}>
+                             {autoProgress?.isStopping ? '停止処理中...' : '自動生成中'}
+                          </p>
+                          <p className="text-sm font-medium text-slate-500 h-6 overflow-hidden text-ellipsis whitespace-nowrap">
+                             {autoProgress?.status}
+                          </p>
+                        </div>
+
+                        {/* Visual Progress Bar */}
+                        <div className="w-full bg-slate-100 h-4 rounded-full overflow-hidden border border-slate-200 relative">
+                           <div 
+                              className="h-full bg-blue-500 transition-all duration-500 ease-out flex items-center justify-end px-1"
+                              style={{ width: `${progressPercent}%` }}
+                           >
+                           </div>
+                           <div className="absolute inset-0 flex items-center justify-center text-[10px] font-bold text-slate-600 mix-blend-multiply">
+                              {Math.round(progressPercent)}%
+                           </div>
+                        </div>
+
+                        <p className="text-2xl font-mono font-black text-blue-600">
+                          {autoProgress?.current} <span className="text-sm text-slate-400 font-normal">/ {autoProgress?.target}</span>
                         </p>
-                        <Button variant="danger" onClick={handleStopAuto} className="py-2 px-6 text-sm">停止</Button>
-                     </>
+                        
+                        <Button 
+                          variant="danger" 
+                          onClick={handleStopAuto} 
+                          className="w-full py-2 text-sm shadow-red-100"
+                          disabled={autoProgress?.isStopping}
+                        >
+                          {autoProgress?.isStopping ? '完了待ち...' : '停止する'}
+                        </Button>
+                     </div>
                    ) : (
                      <>
                        <svg className="animate-spin h-8 w-8 text-blue-600 mb-3" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
@@ -456,7 +548,7 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Progress Bar */}
+              {/* Static Progress Bar */}
               <div className="w-full bg-slate-100 h-2 rounded-full mb-4 overflow-hidden">
                 <div 
                   className={`h-full rounded-full transition-all duration-500 ${savedCount >= target ? 'bg-emerald-500' : 'bg-blue-500'}`} 

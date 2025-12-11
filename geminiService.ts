@@ -70,13 +70,27 @@ export const generateQuizBatch = async (config: GeneratorConfig, apiKey: string)
   `;
 
   let lastError: any = null;
-  const maxRetries = 3;
+  // Increase retries to handle long wait times (e.g., 21s) better
+  const maxRetries = 5;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      // Add delay on retries (Exponential backoff)
       if (attempt > 0) {
-        const waitTime = Math.pow(2, attempt) * 1000 + Math.random() * 1000; // ~2s, 4s, 8s
+        // Default backoff: 2s, 4s, 8s, 16s, 32s
+        let waitTime = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
+        
+        // SMART RETRY: Check if the last error told us specifically how long to wait
+        // Pattern: "Please retry in 21.487686333s"
+        if (lastError && lastError.message) {
+          const match = lastError.message.match(/retry in ([\d\.]+)s/);
+          if (match && match[1]) {
+            const serverWaitSeconds = parseFloat(match[1]);
+            // Wait the requested time + 1 second buffer
+            waitTime = (serverWaitSeconds * 1000) + 1000;
+            console.log(`Server requested wait: ${serverWaitSeconds}s. Sleeping for ${Math.round(waitTime)}ms`);
+          }
+        }
+        
         console.log(`Retry attempt ${attempt}. Waiting ${Math.round(waitTime)}ms`);
         await sleep(waitTime);
       }
@@ -96,7 +110,6 @@ export const generateQuizBatch = async (config: GeneratorConfig, apiKey: string)
         throw new Error("No content generated.");
       }
 
-      // Clean potential markdown formatting just in case
       const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
       
       let rawData;
@@ -111,7 +124,6 @@ export const generateQuizBatch = async (config: GeneratorConfig, apiKey: string)
         throw new Error("AI response format error: expected an array.");
       }
 
-      // Map to internal type with ID
       return rawData.map((item: any) => ({
         ...item,
         id: generateId(),
@@ -121,25 +133,26 @@ export const generateQuizBatch = async (config: GeneratorConfig, apiKey: string)
       console.warn(`Gemini generation attempt ${attempt + 1} failed:`, error);
       lastError = error;
 
-      // Check if error is retryable (503 Service Unavailable or 429 Too Many Requests)
+      // Check if error is retryable
       const isRetryable = 
         error.message?.includes('503') || 
         error.message?.includes('overloaded') ||
+        error.message?.includes('429') ||
+        error.message?.includes('quota') ||
         error.status === 503 ||
         error.code === 503 ||
-        error.status === 429;
+        error.status === 429 ||
+        error.code === 429;
 
       if (isRetryable && attempt < maxRetries) {
         continue; // Try again
       }
       
-      // If it's a non-recoverable error, break immediately
       if (!isRetryable) {
          break;
       }
     }
   }
 
-  // If we get here, all retries failed
   throw lastError || new Error("Failed to generate quiz questions after multiple attempts.");
 };
