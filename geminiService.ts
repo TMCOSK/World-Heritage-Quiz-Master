@@ -48,7 +48,8 @@ export const generateQuizBatch = async (config: GeneratorConfig, apiKey: string)
   }
 
   const ai = new GoogleGenAI({ apiKey });
-  const model = "gemini-2.5-flash"; 
+  // Use Flash Lite as a lighter alternative to 2.5 Flash, since 1.5 Flash is deprecated.
+  const model = "gemini-flash-lite-latest"; 
 
   // If user didn't specify a topic, inject a random one to ensure variety
   const autoTopic = config.focusTopic ? config.focusTopic : getRandomTheme();

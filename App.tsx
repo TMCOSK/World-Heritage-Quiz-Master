@@ -253,9 +253,7 @@ export default function App() {
             
             // Limit per level if needed
             if (levelItems.length > MAX_QUESTIONS_PER_LEVEL) {
-               // This logic is complex in a flat array, but simplified:
-               // Just keep growing localDb, we can trim later if really needed.
-               // For safety, let's just update the count.
+               // simplified limit logic
             }
             
             currentCount = levelItems.length;
@@ -306,11 +304,12 @@ export default function App() {
 
         // Rest between batches if not finished
         if (currentCount < target && !stopAutoRef.current) {
-          // 5 seconds rest
-          for(let i=5; i>0; i--) {
+          // Increase safety buffer to 15 seconds to strictly avoid 15 RPM limits.
+          const safetyWait = 15;
+          for(let i=safetyWait; i>0; i--) {
              if (stopAutoRef.current) break;
              setAutoProgress(prev => ({ 
-               level, current: currentCount, target, status: `休憩中 (${i}秒)...`, isStopping: prev?.isStopping || false 
+               level, current: currentCount, target, status: `制限回避のため休憩中 (${i}秒)...`, isStopping: prev?.isStopping || false 
              }));
              await sleep(1000);
           }
