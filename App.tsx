@@ -23,7 +23,7 @@ const Button: React.FC<React.ButtonHTMLAttributes<HTMLButtonElement> & { variant
 export default function App() {
   const [dbItems, setDbItems] = useState<QuizItem[]>([]);
   const [isInitializing, setIsInitializing] = useState(true);
-  const [isGenerating, setIsGenerating] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('gemini_user_api_key') || '');
   const [view, setView] = useState<'home' | 'play' | 'manage' | 'settings' | 'result'>('home');
   const [studyCount, setStudyCount] = useState(10);
@@ -41,27 +41,19 @@ export default function App() {
   
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // 初期化時に保存データを読み込み。データが空ならリモートから取得
   useEffect(() => {
     const initData = async () => {
       const saved = localStorage.getItem('wh_quiz_data');
       let currentItems: QuizItem[] = saved ? JSON.parse(saved) : [];
 
       if (currentItems.length === 0) {
-        try {
-          const response = await fetch(remoteUrl);
-          if (response.ok) {
-            const remoteData = await response.json();
-            if (Array.isArray(remoteData)) {
-              currentItems = remoteData.map(i => ({...i, id: i.id || generateId()}));
-            }
-          }
-        } catch (e) {
-          currentItems = PRESET_QUIZ_DATA;
-        }
+        // 初回起動時や全削除後はリモートから読み込み
+        await handleFetchRemoteJson(remoteUrl, true);
+      } else {
+        setDbItems(currentItems);
+        setIsInitializing(false);
       }
-
-      setDbItems(currentItems);
-      setIsInitializing(false);
     };
     initData();
   }, []);
@@ -82,26 +74,47 @@ export default function App() {
     );
   }, [dbItems, searchQuery]);
 
-  const handleFetchRemoteJson = async (url: string = remoteUrl) => {
+  const handleFetchRemoteJson = async (url: string = remoteUrl, isInitial: boolean = false) => {
     if (!url.trim()) return;
+    setIsSyncing(true);
     try {
-      const res = await fetch(url);
+      // キャッシュを避けるためにタイムスタンプを付与
+      const cacheBuster = `?t=${new Date().getTime()}`;
+      const res = await fetch(url + (url.includes('?') ? '&' : '') + cacheBuster);
       if (!res.ok) throw new Error();
       const data = await res.json();
+      
       if (Array.isArray(data)) {
-        const unique = data.filter(n => !isDuplicate(n.question, dbItems)).map(i => ({...i, id: i.id || generateId()}));
-        setDbItems(prev => [...prev, ...unique]);
-        alert(`${unique.length}問を新しく同期しました。`);
+        const formatted = data.map(i => ({...i, id: i.id || generateId()}));
+        
+        if (isInitial) {
+          setDbItems(formatted);
+        } else {
+          // 重複していないものだけ追加するか、あるいは完全に置き換えるか選択可能にする
+          if (confirm(`最新のデータから${formatted.length}問見つかりました。現在のリストに統合しますか？\n（「キャンセル」で現在のリストを破棄して最新版に完全入れ替えします）`)) {
+            const unique = formatted.filter(n => !isDuplicate(n.question, dbItems));
+            setDbItems(prev => [...prev, ...unique]);
+            alert(`${unique.length}問の新規問題を追加しました。`);
+          } else {
+            setDbItems(formatted);
+            alert(`最新の${formatted.length}問に更新しました。`);
+          }
+        }
       }
     } catch (e) {
-      alert('同期に失敗しました。URLが正しいこと（GitHubの場合はRaw URLであること）を確認してください。');
+      console.error(e);
+      if (isInitial) setDbItems(PRESET_QUIZ_DATA);
+      else alert('データの同期に失敗しました。URLを確認してください。');
+    } finally {
+      setIsSyncing(false);
+      setIsInitializing(false);
     }
   };
 
   const processCsvText = (text: string) => {
     const parsed = parseCSV(text);
     if (parsed.length === 0) {
-      alert("CSV形式が正しくありません。ヘッダー（level,question...）を確認してください。");
+      alert("CSV形式が正しくありません。");
       return;
     }
     const unique = parsed.filter(n => !isDuplicate(n.question, dbItems));
@@ -118,14 +131,10 @@ export default function App() {
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-
     const reader = new FileReader();
     reader.onload = (event) => {
       const text = event.target?.result as string;
-      if (text) {
-        processCsvText(text);
-      }
-      // Reset input
+      if (text) processCsvText(text);
       if (fileInputRef.current) fileInputRef.current.value = '';
     };
     reader.readAsText(file);
@@ -169,7 +178,10 @@ export default function App() {
 
   if (isInitializing) return (
     <div className="min-h-screen flex items-center justify-center bg-slate-50">
-      <div className="animate-spin h-12 w-12 border-4 border-blue-600 border-t-transparent rounded-full mx-auto"></div>
+      <div className="text-center space-y-4">
+        <div className="animate-spin h-12 w-12 border-4 border-blue-600 border-t-transparent rounded-full mx-auto"></div>
+        <p className="text-xs font-bold text-slate-400">Loading library...</p>
+      </div>
     </div>
   );
 
@@ -177,12 +189,12 @@ export default function App() {
     <div className="max-w-4xl mx-auto space-y-12 py-10 px-4 animate-fade-in">
       <div className="text-center space-y-4">
         <h1 className="text-5xl font-black text-slate-800 tracking-tight">世界遺産検定 <span className="text-blue-600">Master</span></h1>
-        <p className="text-slate-400 font-medium">問題管理・学習プラットフォーム</p>
+        <p className="text-slate-400 font-medium">合計 {dbItems.length} 問のライブラリ</p>
       </div>
 
       <div className="flex justify-center">
         <div className="bg-white p-2 rounded-2xl shadow-sm border border-slate-200 flex gap-1">
-          {[10, 20, 30, 50].map(c => (
+          {[10, 20, 30, 50, 100].map(c => (
             <button key={c} onClick={() => setStudyCount(c)} className={`px-6 py-2 rounded-xl text-sm font-bold transition-all ${studyCount === c ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-500 hover:bg-slate-50'}`}>{c}問</button>
           ))}
         </div>
@@ -196,7 +208,7 @@ export default function App() {
               <div className="flex justify-between items-start mb-6">
                 <div>
                   <h3 className="text-3xl font-black text-slate-800">{level}</h3>
-                  <p className="text-xs font-bold text-blue-500 mt-1 uppercase tracking-widest">Questions</p>
+                  <p className="text-xs font-bold text-blue-500 mt-1 uppercase tracking-widest">Available Items</p>
                 </div>
                 <div className="text-right">
                   <span className="text-4xl font-black text-slate-700">{count}</span>
@@ -218,75 +230,50 @@ export default function App() {
 
   const renderManage = () => (
     <div className="max-w-4xl mx-auto space-y-8 py-10 px-4 animate-fade-in-up">
-      <div className="bg-white p-8 rounded-[2rem] border border-slate-200 shadow-sm">
-        <h2 className="text-2xl font-black mb-2 flex items-center gap-2">📥 300問一括インポート</h2>
-        <p className="text-xs text-slate-500 mb-6">
-          CSVファイルを選択するか、Excel等からコピーしたデータを貼り付けてください。
+      <div className="bg-white p-8 rounded-[2rem] border border-slate-200 shadow-sm relative overflow-hidden">
+        {isSyncing && <div className="absolute inset-0 bg-white/60 backdrop-blur-sm flex items-center justify-center z-10 font-bold">同期中...</div>}
+        <h2 className="text-2xl font-black mb-6">🌐 GitHub / 外部データ同期</h2>
+        <p className="text-xs text-slate-500 mb-4 leading-relaxed">
+          GitHubにアップロードした JSON が反映されない場合は、下の「最新状態に更新」ボタンを押してください。<br/>
+          ブラウザのキャッシュを無視して、最新のファイルを強制的に取得します。
         </p>
-        
-        <div className="space-y-6">
-          <div className="p-6 bg-slate-50 rounded-2xl border-2 border-dashed border-slate-200 flex flex-col items-center justify-center gap-3">
-            <span className="text-3xl">📄</span>
-            <p className="text-sm font-bold text-slate-600">CSVファイルを直接読み込む</p>
-            <input 
-              type="file" 
-              accept=".csv" 
-              className="hidden" 
-              ref={fileInputRef} 
-              onChange={handleFileChange}
-            />
-            <Button variant="primary" onClick={() => fileInputRef.current?.click()}>
-              ファイルを選択
-            </Button>
-          </div>
-
-          <div className="relative">
-            <div className="absolute inset-0 flex items-center"><span className="w-full border-t border-slate-200"></span></div>
-            <div className="relative flex justify-center text-xs uppercase"><span className="bg-white px-4 text-slate-400 font-bold tracking-widest">OR Paste Text</span></div>
-          </div>
-
-          <div>
-            <textarea 
-              className="w-full h-32 p-4 bg-slate-50 border border-slate-200 rounded-2xl font-mono text-[10px] mb-3 outline-none focus:border-blue-400"
-              placeholder="3級,問題文,選択肢1,選択肢2,選択肢3,選択肢4,0,解説文,詳細文,http://...,TRUE"
-              value={bulkInput}
-              onChange={e => setBulkInput(e.target.value)}
-            />
-            <Button variant="secondary" className="w-full" onClick={handleBulkImport} disabled={!bulkInput.trim()}>
-              テキストから追加
-            </Button>
-          </div>
+        <div className="flex flex-col gap-3">
+          <input type="text" placeholder="questions.json のURL" value={remoteUrl} onChange={e => setRemoteUrl(e.target.value)} className="flex-1 px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:border-blue-400 text-xs font-mono" />
+          <Button variant="primary" className="w-full py-4" onClick={() => handleFetchRemoteJson(remoteUrl)} disabled={isSyncing}>
+            {isSyncing ? '取得中...' : '最新状態に更新 (強制同期)'}
+          </Button>
         </div>
       </div>
 
       <div className="bg-white p-8 rounded-[2rem] border border-slate-200 shadow-sm">
-        <h2 className="text-2xl font-black mb-6">🌐 GitHub同期</h2>
-        <div className="flex gap-3">
-          <input type="text" placeholder="GitHub Raw URL" value={remoteUrl} onChange={e => setRemoteUrl(e.target.value)} className="flex-1 px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:border-blue-400 text-xs font-mono" />
-          <Button variant="primary" onClick={() => handleFetchRemoteJson()}>同期</Button>
+        <h2 className="text-2xl font-black mb-2">📥 データの直接追加</h2>
+        <p className="text-xs text-slate-500 mb-6">CSVファイルやテキストから新しい問題を即座に追加できます。</p>
+        <div className="space-y-4">
+          <Button variant="outline" className="w-full py-4" onClick={() => fileInputRef.current?.click()}>CSVファイルを選択して読み込む</Button>
+          <input type="file" accept=".csv" className="hidden" ref={fileInputRef} onChange={handleFileChange} />
+          <textarea className="w-full h-24 p-4 bg-slate-50 border border-slate-200 rounded-2xl font-mono text-[10px] outline-none focus:border-blue-400" placeholder="レベル,問題文,選択肢1... (CSV形式テキストを貼り付け)" value={bulkInput} onChange={e => setBulkInput(e.target.value)} />
+          <Button variant="secondary" className="w-full" onClick={handleBulkImport} disabled={!bulkInput.trim()}>テキストから読み込む</Button>
         </div>
       </div>
 
       <div className="bg-white p-8 rounded-[2rem] border border-slate-200 shadow-sm">
         <div className="flex justify-between items-center mb-6">
-          <h2 className="text-xl font-black">現在のライブラリ ({dbItems.length})</h2>
+          <h2 className="text-xl font-black">全データ ({dbItems.length} 問)</h2>
           <input type="text" placeholder="検索..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} className="px-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-sm outline-none focus:border-blue-400" />
         </div>
-        <div className="max-h-60 overflow-y-auto divide-y divide-slate-100 mb-8">
-          {filteredItems.slice(0, 100).map(item => (
-            <div key={item.id} className="py-2 flex justify-between items-center group text-xs">
+        <div className="max-h-60 overflow-y-auto divide-y divide-slate-100 mb-8 text-xs">
+          {filteredItems.length === 0 ? <p className="py-10 text-center text-slate-300">データがありません</p> : filteredItems.slice(0, 100).map(item => (
+            <div key={item.id} className="py-2 flex justify-between items-center group">
               <span className="flex-1 line-clamp-1">{item.question}</span>
-              <button onClick={() => setDbItems(prev => prev.filter(i => i.id !== item.id))} className="text-red-400 px-2">削除</button>
+              <button onClick={() => setDbItems(prev => prev.filter(i => i.id !== item.id))} className="text-red-400 px-2 opacity-0 group-hover:opacity-100">削除</button>
             </div>
           ))}
         </div>
         <div className="grid grid-cols-2 gap-4 border-t pt-6">
-          <Button variant="success" onClick={() => downloadJson(dbItems, 'questions.json')}>📥 JSONを保存</Button>
-          <Button variant="danger" onClick={() => confirm('全削除しますか？') && setDbItems([])}>全消去</Button>
+          <Button variant="success" onClick={() => downloadJson(dbItems, 'questions.json')}>📥 JSONを保存 (バックアップ)</Button>
+          <Button variant="danger" onClick={() => confirm('全てのデータを消去しますか？') && setDbItems([])}>全データ消去</Button>
         </div>
-        <p className="text-[10px] text-slate-400 text-center mt-4">※追加した問題をGitHubに反映するには、ここでJSONを保存してGitHubへアップロードしてください。</p>
       </div>
-
       <Button variant="secondary" className="w-full py-4" onClick={() => setView('home')}>ホームに戻る</Button>
     </div>
   );
@@ -305,23 +292,25 @@ export default function App() {
               <span className="text-slate-300">/ {sessionItems.length}</span>
             </div>
           </div>
+          <p className="text-sm font-bold text-emerald-600">正解: {score}</p>
         </div>
         <div className="bg-white p-10 rounded-[3rem] shadow-xl border border-slate-100 mb-8 relative">
-          {q.is_japan && <div className="absolute top-0 right-0 bg-red-50 text-red-500 px-6 py-2 rounded-bl-3xl text-[10px] font-black">JAPAN</div>}
+          {q.is_japan && <div className="absolute top-0 right-0 bg-red-50 text-red-500 px-6 py-2 rounded-bl-3xl text-[10px] font-black tracking-widest">JAPAN</div>}
           <h2 className="text-2xl font-bold leading-relaxed">{q.question}</h2>
         </div>
         <div className="grid gap-4">
           {opts.map((opt, i) => (
-            <button key={i} onClick={() => handleAnswer(i)} disabled={showResult} className={`p-6 text-left rounded-3xl border-2 font-bold transition-all ${showResult ? (i === q.correct_idx ? 'bg-emerald-50 border-emerald-500 text-emerald-800' : (i === selectedOption ? 'bg-red-50 border-red-500 text-red-800' : 'opacity-40')) : 'bg-white border-slate-200 hover:border-blue-400'}`}>
+            <button key={i} onClick={() => handleAnswer(i)} disabled={showResult} className={`p-6 text-left rounded-3xl border-2 font-bold transition-all ${showResult ? (i === q.correct_idx ? 'bg-emerald-50 border-emerald-500 text-emerald-800 scale-[1.02]' : (i === selectedOption ? 'bg-red-50 border-red-500 text-red-800' : 'opacity-40 border-slate-100')) : 'bg-white border-slate-200 hover:border-blue-400 hover:shadow-lg active:scale-95'}`}>
               {opt}
             </button>
           ))}
         </div>
         {showResult && (
           <div className="mt-8 animate-fade-in-up">
-            <div className="bg-white p-8 rounded-[2.5rem] shadow-lg mb-6">
-              <p className="text-slate-600 mb-4">{q.explanation}</p>
-              <Button className="w-full" onClick={nextQuestion}>{currentQIndex === sessionItems.length - 1 ? '結果を見る' : '次へ'}</Button>
+            <div className="bg-white p-8 rounded-[2.5rem] shadow-lg mb-6 border border-slate-100">
+              <p className="text-slate-600 mb-4 font-medium leading-relaxed">{q.explanation}</p>
+              <div className="bg-slate-50 p-4 rounded-2xl text-xs text-slate-500 leading-relaxed mb-4">{q.advanced_explanation}</div>
+              <Button className="w-full py-4 text-lg" onClick={nextQuestion}>{currentQIndex === sessionItems.length - 1 ? '結果発表' : '次へ進む'}</Button>
             </div>
           </div>
         )}
@@ -331,10 +320,13 @@ export default function App() {
 
   const renderResult = () => (
     <div className="max-w-2xl mx-auto py-16 px-4 text-center animate-fade-in">
-      <h2 className="text-6xl font-black mb-4">{score} <span className="text-2xl text-slate-400">/ {sessionItems.length}</span></h2>
-      <div className="grid grid-cols-2 gap-4 mt-12">
-        <Button variant="primary" onClick={() => startLibraryStudy(sessionItems[0].level as QuizLevel)}>もう一度</Button>
-        <Button variant="secondary" onClick={() => setView('home')}>ホーム</Button>
+      <div className="mb-12">
+        <h2 className="text-7xl font-black text-slate-800 mb-4">{score} <span className="text-2xl text-slate-400">/ {sessionItems.length}</span></h2>
+        <p className="text-slate-400 font-bold uppercase tracking-widest">Result Summary</p>
+      </div>
+      <div className="grid grid-cols-2 gap-4">
+        <Button variant="primary" className="py-4" onClick={() => startLibraryStudy(sessionItems[0].level as QuizLevel)}>もう一度解く</Button>
+        <Button variant="secondary" className="py-4" onClick={() => setView('home')}>ホームへ</Button>
       </div>
     </div>
   );
@@ -342,11 +334,11 @@ export default function App() {
   return (
     <div className="min-h-screen bg-slate-50">
       <nav className="fixed bottom-0 left-0 right-0 bg-white/80 backdrop-blur-md border-t h-16 flex justify-around items-center z-50 md:top-0 md:bottom-auto md:border-b">
-        <button onClick={() => setView('home')} className={`font-bold text-xs ${view === 'home' ? 'text-blue-600' : 'text-slate-400'}`}>🏠 ホーム</button>
-        <button onClick={() => setView('manage')} className={`font-bold text-xs ${view === 'manage' ? 'text-blue-600' : 'text-slate-400'}`}>📂 データ</button>
-        <button onClick={() => setView('settings')} className={`font-bold text-xs ${view === 'settings' ? 'text-blue-600' : 'text-slate-400'}`}>⚙️ 設定</button>
+        <button onClick={() => setView('home')} className={`font-bold text-xs flex flex-col items-center gap-1 ${view === 'home' ? 'text-blue-600' : 'text-slate-400'}`}><span>🏠</span><span>ホーム</span></button>
+        <button onClick={() => setView('manage')} className={`font-bold text-xs flex flex-col items-center gap-1 ${view === 'manage' ? 'text-blue-600' : 'text-slate-400'}`}><span>📂</span><span>データ</span></button>
+        <button onClick={() => setView('settings')} className={`font-bold text-xs flex flex-col items-center gap-1 ${view === 'settings' ? 'text-blue-600' : 'text-slate-400'}`}><span>⚙️</span><span>設定</span></button>
       </nav>
-      <main className="pt-6 pb-24 md:pt-24">{view === 'home' && renderHome()}{view === 'play' && renderPlay()}{view === 'manage' && renderManage()}{view === 'result' && renderResult()}{view === 'settings' && <div className="max-w-xl mx-auto py-10 px-4"><div className="bg-white p-8 rounded-[2rem] border shadow-sm"><h2>設定</h2><Button onClick={() => setView('home')}>完了</Button></div></div>}</main>
+      <main className="pt-6 pb-24 md:pt-24">{view === 'home' && renderHome()}{view === 'play' && renderPlay()}{view === 'manage' && renderManage()}{view === 'result' && renderResult()}{view === 'settings' && <div className="max-w-xl mx-auto py-10 px-4"><div className="bg-white p-8 rounded-[2rem] border shadow-sm"><h2 className="text-xl font-black mb-6">設定</h2><label className="text-xs font-bold text-slate-400 mb-2 block">Gemini APIキー</label><input type="password" value={apiKey} onChange={e => {setApiKey(e.target.value); localStorage.setItem('gemini_user_api_key', e.target.value);}} className="w-full p-3 bg-slate-50 border rounded-xl mb-6 outline-none focus:border-blue-400" /><Button className="w-full" onClick={() => setView('home')}>完了</Button></div></div>}</main>
     </div>
   );
 }
