@@ -1,10 +1,10 @@
-import React, { useState, useRef, useEffect } from 'react';
+
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { QuizItem, QuizLevel, GeneratorConfig } from './types';
 import { generateQuizBatch } from './geminiService';
-import { parseCSV, toCSV, downloadCSV, isDuplicate, shuffleArray } from './utils';
+import { parseCSV, toCSV, downloadCSV, isDuplicate, shuffleArray, generateId } from './utils';
 import { PRESET_QUIZ_DATA } from './presets';
 
-// --- Constants ---
 const LEVEL_TARGETS: Record<string, number> = {
   [QuizLevel.LEVEL_3]: 300,
   [QuizLevel.LEVEL_2]: 600,
@@ -12,12 +12,10 @@ const LEVEL_TARGETS: Record<string, number> = {
   [QuizLevel.LEVEL_1]: 1000,
 };
 
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
 const Button: React.FC<React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: 'primary' | 'secondary' | 'danger' | 'success' | 'outline' | 'ghost' }> = ({ 
   children, variant = 'primary', className = '', ...props 
 }) => {
-  const base = "px-4 py-3 rounded-xl font-bold transition-all duration-200 active:scale-95 disabled:opacity-50 shadow-sm flex items-center justify-center gap-2";
+  const base = "px-4 py-3 rounded-xl font-bold transition-all duration-200 active:scale-95 disabled:opacity-50 shadow-sm flex items-center justify-center gap-2 text-sm";
   const variants = {
     primary: "bg-blue-600 text-white hover:bg-blue-700",
     secondary: "bg-slate-100 text-slate-700 border border-slate-200 hover:bg-slate-200",
@@ -30,323 +28,327 @@ const Button: React.FC<React.ButtonHTMLAttributes<HTMLButtonElement> & { variant
 };
 
 export default function App() {
-  const [dbItems, setDbItems] = useState<QuizItem[]>(() => {
-    const saved = localStorage.getItem('wh_quiz_data');
-    return saved ? JSON.parse(saved) : PRESET_QUIZ_DATA;
-  });
-
+  const [dbItems, setDbItems] = useState<QuizItem[]>([]);
+  const [isInitializing, setIsInitializing] = useState(true);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('gemini_user_api_key') || '');
-  const [tempKeyInput, setTempKeyInput] = useState('');
-  const [sessionItems, setSessionItems] = useState<QuizItem[]>([]);
-  const [view, setView] = useState<'home' | 'play' | 'manage' | 'settings'>('home');
-  const [isGenerating, setIsGenerating] = useState(false);
-  const [loadingLevel, setLoadingLevel] = useState<QuizLevel | null>(null);
+  const [view, setView] = useState<'home' | 'play' | 'manage' | 'settings' | 'result'>('home');
   const [studyCount, setStudyCount] = useState(10);
-  const stopAutoRef = useRef(false);
-  const [autoProgress, setAutoProgress] = useState<{ level: QuizLevel, current: number, target: number, status: string } | null>(null);
-
+  const [sessionItems, setSessionItems] = useState<QuizItem[]>([]);
+  
+  // States for Quiz Play
   const [currentQIndex, setCurrentQIndex] = useState(0);
   const [selectedOption, setSelectedOption] = useState<number | null>(null);
   const [showResult, setShowResult] = useState(false);
   const [score, setScore] = useState(0);
+  const [quizResults, setQuizResults] = useState<{item: QuizItem, selected: number, isCorrect: boolean}[]>([]);
 
+  // States for Data Management
+  const [bulkInput, setBulkInput] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [remoteUrl, setRemoteUrl] = useState('./questions.json'); // デフォルトで自身のJSONを指す
+
+  // 1. 初期ロード (LocalStorage -> questions.json -> Presets)
   useEffect(() => {
-    localStorage.setItem('wh_quiz_data', JSON.stringify(dbItems));
-  }, [dbItems]);
+    const initData = async () => {
+      // a. ローカルストレージをチェック
+      const saved = localStorage.getItem('wh_quiz_data');
+      let currentItems: QuizItem[] = saved ? JSON.parse(saved) : [];
 
-  const handleSaveApiKey = () => {
-    setApiKey(tempKeyInput.trim());
-    localStorage.setItem('gemini_user_api_key', tempKeyInput.trim());
-    alert("APIキーを保存しました");
-    setView('home');
-  };
+      // b. ストレージが空、あるいは更新チェックとして 'questions.json' を試行
+      try {
+        const response = await fetch('./questions.json');
+        if (response.ok) {
+          const remoteData = await response.json();
+          if (Array.isArray(remoteData)) {
+            // 重複していないものだけ追加
+            const newItems = remoteData.filter(n => !currentItems.some(c => c.question === n.question));
+            currentItems = [...currentItems, ...newItems.map(i => ({...i, id: i.id || generateId()}))];
+            console.log(`Loaded ${newItems.length} new items from questions.json`);
+          }
+        }
+      } catch (e) {
+        console.log("No local questions.json found or fetch failed, using presets.");
+      }
 
-  const handleRestorePresets = () => {
-    if (confirm('ライブラリをプリセットデータ（初期状態）に戻しますか？\n現在保存されている追加問題は消去されます。')) {
-      setDbItems(PRESET_QUIZ_DATA);
-      alert('プリセットデータを読み込みました。');
+      // c. まだ空ならプリセットを流し込む
+      if (currentItems.length === 0) {
+        currentItems = PRESET_QUIZ_DATA;
+      }
+
+      setDbItems(currentItems);
+      setIsInitializing(false);
+    };
+    initData();
+  }, []);
+
+  // 2. 保存
+  useEffect(() => {
+    if (!isInitializing) {
+      localStorage.setItem('wh_quiz_data', JSON.stringify(dbItems));
+    }
+  }, [dbItems, isInitializing]);
+
+  const filteredItems = useMemo(() => {
+    if (!searchQuery) return dbItems;
+    const q = searchQuery.toLowerCase();
+    return dbItems.filter(item => 
+      item.question.toLowerCase().includes(q) || 
+      item.explanation.toLowerCase().includes(q)
+    );
+  }, [dbItems, searchQuery]);
+
+  const handleFetchRemoteJson = async (url: string = remoteUrl) => {
+    if (!url.trim()) return;
+    try {
+      const res = await fetch(url);
+      const data = await res.json();
+      if (Array.isArray(data)) {
+        const unique = data.filter(n => !isDuplicate(n.question, dbItems)).map(i => ({...i, id: i.id || generateId()}));
+        setDbItems(prev => [...prev, ...unique]);
+        alert(`${unique.length}問を新しくインポートしました。`);
+      }
+    } catch (e) {
+      alert('データの同期に失敗しました。パスや形式を確認してください。');
     }
   };
 
-  const handleAutoGenerate = async (level: QuizLevel) => {
-    if (isGenerating || !apiKey) {
-      if (!apiKey) {
-        alert("AIによる生成には設定画面からGemini APIキーの入力が必要です。");
-        setView('settings');
-      }
+  const handleBulkImport = () => {
+    if (!bulkInput.trim()) return;
+    const parsed = parseCSV(bulkInput);
+    if (parsed.length === 0) {
+      alert("CSV形式が正しくありません。");
       return;
     }
-    const target = LEVEL_TARGETS[level];
-    let localDb = [...dbItems];
-    let currentCount = localDb.filter(i => i.level === level).length;
-
-    if (!window.confirm(`AIで新しい問題を生成し、ライブラリに追加します。\n1日のリクエスト制限(20回)に注意してください。`)) return;
-
-    setIsGenerating(true);
-    setLoadingLevel(level);
-    stopAutoRef.current = false;
-    setAutoProgress({ level, current: currentCount, target, status: '準備中...' });
-
-    try {
-      while (currentCount < target && !stopAutoRef.current) {
-        setAutoProgress(prev => prev ? { ...prev, status: 'AIが執筆中 (5問)...' } : null);
-        try {
-          const newItems = await generateQuizBatch({ level, count: 5 }, apiKey);
-          const uniqueItems = newItems.filter(newItem => !isDuplicate(newItem.question, localDb));
-          localDb = [...localDb, ...uniqueItems];
-          currentCount = localDb.filter(i => i.level === level).length;
-          setDbItems(localDb);
-
-          if (currentCount >= target || stopAutoRef.current) break;
-
-          for(let i=12; i>0; i--) {
-            if (stopAutoRef.current) break;
-            setAutoProgress(prev => prev ? { ...prev, current: currentCount, status: `API制限回避のため待機中 (${i}秒)...` } : null);
-            await sleep(1000);
-          }
-        } catch (err: any) {
-          if (err.message?.includes('429')) {
-            alert("1日の制限(RPD 20回)に達した可能性があります。本日の生成を終了します。");
-            break;
-          }
-          await sleep(5000);
-        }
-      }
-    } finally {
-      setIsGenerating(false);
-      setLoadingLevel(null);
-      setAutoProgress(null);
-    }
+    const unique = parsed.filter(n => !isDuplicate(n.question, dbItems));
+    setDbItems(prev => [...prev, ...unique]);
+    setBulkInput('');
+    alert(`${unique.length}問を追加しました。`);
   };
 
   const startLibraryStudy = (level: QuizLevel) => {
     const levelItems = dbItems.filter(i => i.level === level);
     if (levelItems.length === 0) {
-      alert("ライブラリに問題がありません。まずはAIで生成するかCSVを取り込んでください。");
+      alert("このレベルの問題がありません。管理画面から同期してください。");
       return;
     }
     const shuffled = shuffleArray(levelItems);
     setSessionItems(shuffled.slice(0, studyCount));
     setCurrentQIndex(0);
     setScore(0);
+    setQuizResults([]);
     setSelectedOption(null);
     setShowResult(false);
     setView('play');
   };
 
-  const handleImportCSV = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onload = (evt) => {
-        const text = evt.target?.result as string;
-        const parsed = parseCSV(text);
-        if (confirm(`${parsed.length}問をライブラリに追加しますか？`)) {
-           const unique = parsed.filter(n => !isDuplicate(n.question, dbItems));
-           setDbItems(prev => [...prev, ...unique]);
-        }
-      };
-      reader.readAsText(file);
+  const handleAnswer = (idx: number) => {
+    if (showResult) return;
+    setSelectedOption(idx);
+    setShowResult(true);
+    const item = sessionItems[currentQIndex];
+    const isCorrect = idx === item.correct_idx;
+    if (isCorrect) setScore(s => s + 1);
+    setQuizResults(prev => [...prev, { item, selected: idx, isCorrect }]);
+  };
+
+  const nextQuestion = () => {
+    if (currentQIndex < sessionItems.length - 1) {
+      setCurrentQIndex(c => c + 1);
+      setSelectedOption(null);
+      setShowResult(false);
+    } else {
+      setView('result');
     }
   };
 
+  if (isInitializing) return (
+    <div className="min-h-screen flex items-center justify-center bg-slate-50">
+      <div className="text-center">
+        <div className="animate-spin h-12 w-12 border-4 border-blue-600 border-t-transparent rounded-full mx-auto mb-4"></div>
+        <p className="text-slate-500 font-bold">ライブラリを最適化中...</p>
+      </div>
+    </div>
+  );
+
   const renderHome = () => (
-    <div className="flex flex-col items-center space-y-10 animate-fade-in px-4 pb-20">
+    <div className="max-w-4xl mx-auto space-y-12 py-10 px-4 animate-fade-in">
       <div className="text-center space-y-4">
-        <h1 className="text-4xl md:text-5xl font-black text-slate-800 tracking-tight">世界遺産検定 <span className="text-blue-600">AI</span></h1>
-        <p className="text-slate-500 max-w-md mx-auto">AIで問題ライブラリを構築し、いつでも学習できるパーソナル問題集アプリです。</p>
+        <h1 className="text-5xl font-black text-slate-800 tracking-tight">世界遺産検定 <span className="text-blue-600">Master</span></h1>
+        <p className="text-slate-400 font-medium">外部JSON同期システム搭載・学習ライブラリ</p>
       </div>
 
-      <div className="bg-white p-2 rounded-2xl shadow-sm border border-slate-200 flex gap-1">
-        {[10, 20, 30, 50].map(c => (
-          <button 
-            key={c} 
-            onClick={() => setStudyCount(c)}
-            className={`px-4 py-2 rounded-xl text-sm font-bold transition-all ${studyCount === c ? 'bg-blue-600 text-white shadow-md' : 'text-slate-500 hover:bg-slate-50'}`}
-          >
-            {c}問
-          </button>
-        ))}
-        <div className="px-3 flex items-center text-xs font-bold text-slate-400 border-l ml-1">学習セット数</div>
+      <div className="flex justify-center">
+        <div className="bg-white p-2 rounded-2xl shadow-sm border border-slate-200 flex gap-1">
+          {[10, 20, 30, 50].map(c => (
+            <button 
+              key={c} 
+              onClick={() => setStudyCount(c)}
+              className={`px-6 py-2 rounded-xl text-sm font-bold transition-all ${studyCount === c ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-500 hover:bg-slate-50'}`}
+            >
+              {c}問
+            </button>
+          ))}
+        </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6 w-full max-w-4xl">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         {Object.values(QuizLevel).map((level) => {
           const count = dbItems.filter(i => i.level === level).length;
-          const target = LEVEL_TARGETS[level];
-          const isLoading = isGenerating && loadingLevel === level;
-          
           return (
-            <div key={level} className="bg-white p-6 rounded-3xl shadow-sm border border-slate-200 transition-all hover:shadow-md relative overflow-hidden">
-              {isLoading && (
-                <div className="absolute inset-0 bg-white/95 z-10 flex flex-col items-center justify-center p-6 text-center animate-fade-in">
-                  <div className="animate-spin h-10 w-10 border-4 border-blue-600 border-t-transparent rounded-full mb-4"></div>
-                  <p className="text-sm font-bold text-blue-600 mb-1">{autoProgress?.status}</p>
-                  <p className="text-2xl font-black text-slate-800">{autoProgress?.current} / {target}</p>
-                  <button onClick={() => stopAutoRef.current = true} className="mt-6 text-xs text-red-500 font-bold hover:underline">生成を中断する</button>
-                </div>
-              )}
-              
+            <div key={level} className="bg-white p-8 rounded-[2.5rem] shadow-sm border border-slate-200 hover:shadow-xl transition-all group">
               <div className="flex justify-between items-start mb-6">
                 <div>
-                  <h3 className="text-2xl font-black text-slate-800">{level}</h3>
-                  <p className="text-xs font-bold text-slate-400 mt-1 uppercase tracking-widest">Library Status</p>
+                  <h3 className="text-3xl font-black text-slate-800">{level}</h3>
+                  <p className="text-xs font-bold text-blue-500 mt-1 uppercase tracking-widest">Library Volume</p>
                 </div>
                 <div className="text-right">
-                  <span className="text-3xl font-black text-slate-700">{count}</span>
-                  <span className="text-xs font-bold text-slate-400 ml-1">/ {target}問</span>
+                  <span className="text-4xl font-black text-slate-700">{count}</span>
+                  <span className="text-sm font-bold text-slate-400 ml-1">問</span>
                 </div>
               </div>
-
-              <div className="w-full bg-slate-100 h-3 rounded-full mb-8 overflow-hidden">
-                <div className="h-full bg-blue-500 transition-all duration-1000" style={{ width: `${Math.min(100, (count / target) * 100)}%` }} />
-              </div>
-
-              <div className="space-y-3">
-                <Button className="w-full py-4 text-lg shadow-blue-100" onClick={() => startLibraryStudy(level as QuizLevel)} disabled={count === 0}>
-                  📚 学習を開始する
-                </Button>
-                <div className="grid grid-cols-1 gap-2">
-                  <button 
-                    onClick={() => handleAutoGenerate(level as QuizLevel)} 
-                    disabled={isGenerating}
-                    className="flex items-center justify-center gap-2 text-sm font-bold text-blue-600 hover:bg-blue-50 py-3 rounded-xl transition-colors border border-transparent hover:border-blue-100"
-                  >
-                    <span>✨ AIで新しい問題を増やす</span>
-                  </button>
-                </div>
-              </div>
+              <Button className="w-full py-5 text-xl rounded-2xl" onClick={() => startLibraryStudy(level as QuizLevel)} disabled={count === 0}>
+                学習を開始する
+              </Button>
             </div>
           );
         })}
       </div>
 
-      <div className="flex gap-4">
-        <Button variant="ghost" onClick={() => setView('manage')}>📂 データ管理・取り込み</Button>
+      <div className="flex flex-col items-center gap-6 pt-10 border-t border-slate-200">
+        <div className="flex gap-4">
+          <Button variant="outline" onClick={() => setView('manage')}>📂 データ同期</Button>
+          <Button variant="ghost" onClick={() => setView('settings')}>⚙️ 設定</Button>
+        </div>
+        <p className="text-xs text-slate-400">Current Library: {dbItems.length} questions loaded</p>
       </div>
     </div>
   );
 
   const renderManage = () => (
-    <div className="max-w-2xl mx-auto bg-white p-8 rounded-3xl shadow-sm border border-slate-200 animate-fade-in-up">
-      <h2 className="text-2xl font-black text-slate-800 mb-8 flex items-center gap-3">
-        <span className="bg-emerald-100 p-2 rounded-xl text-xl">📂</span>
-        データライブラリ管理
-      </h2>
-      
-      <div className="space-y-8">
-        <div className="grid grid-cols-2 gap-4">
-          {Object.values(QuizLevel).map(lvl => (
-            <div key={lvl} className="bg-slate-50 p-4 rounded-2xl border border-slate-100">
-              <span className="text-xs font-bold text-slate-400 block mb-1 uppercase tracking-tighter">{lvl}</span>
-              <span className="text-2xl font-black text-slate-700">{dbItems.filter(i => i.level === lvl).length}問</span>
+    <div className="max-w-4xl mx-auto space-y-8 py-10 px-4 animate-fade-in-up">
+      <div className="bg-white p-8 rounded-[2rem] border border-slate-200 shadow-sm">
+        <h2 className="text-2xl font-black mb-6 flex items-center gap-3">🌐 JSONライブラリ同期</h2>
+        <div className="space-y-4">
+          <div className="flex gap-3">
+            <input 
+              type="text" 
+              placeholder="外部URLまたはパス (./questions.json)" 
+              value={remoteUrl}
+              onChange={e => setRemoteUrl(e.target.value)}
+              className="flex-1 px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:border-blue-400 transition-all"
+            />
+            <Button variant="primary" onClick={() => handleFetchRemoteJson()}>同期</Button>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+             <Button variant="secondary" onClick={() => handleFetchRemoteJson('./questions.json')}>標準JSONをロード</Button>
+             <Button variant="outline" onClick={() => setRemoteUrl('https://raw.githubusercontent.com/username/repo/main/questions.json')}>GitHubから同期例</Button>
+          </div>
+        </div>
+        <p className="text-[10px] text-slate-400 mt-4 leading-relaxed">
+          ※ `questions.json` をアプリと同じフォルダに置くと、起動時に自動読み込みされます。<br/>
+          ※ 外部URLを指定して、常に最新の問題集を配信することも可能です。
+        </p>
+      </div>
+
+      <div className="bg-white p-8 rounded-[2rem] border border-slate-200 shadow-sm">
+        <div className="flex justify-between items-center mb-6">
+          <h2 className="text-xl font-black">登録済み問題一覧 ({dbItems.length})</h2>
+          <input 
+            type="text" 
+            placeholder="検索..." 
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
+            className="px-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-sm outline-none focus:border-blue-400"
+          />
+        </div>
+        <div className="max-h-80 overflow-y-auto divide-y divide-slate-100">
+          {filteredItems.slice(0, 100).map(item => (
+            <div key={item.id} className="py-3 flex justify-between items-center group">
+              <div className="flex-1 pr-4">
+                <span className="text-[10px] font-bold text-blue-500 mr-2">{item.level}</span>
+                <span className="text-sm text-slate-700 line-clamp-1">{item.question}</span>
+              </div>
+              <button onClick={() => setDbItems(prev => prev.filter(i => i.id !== item.id))} className="text-red-400 opacity-0 group-hover:opacity-100 transition-opacity px-2">削除</button>
             </div>
           ))}
+          {filteredItems.length === 0 && <p className="py-10 text-center text-slate-400 italic">該当する問題がありません。</p>}
         </div>
-
-        <div className="border-t pt-8 space-y-6">
-          <section>
-            <h3 className="text-sm font-bold text-slate-500 mb-3 uppercase tracking-wider">プリセット管理</h3>
-            <Button variant="outline" className="w-full text-blue-600 border-blue-200 hover:bg-blue-50" onClick={handleRestorePresets}>
-              📦 パッケージ内データを同期する
-            </Button>
-            <p className="text-[10px] text-slate-400 mt-2 text-center">※アプリに組み込まれた基本データをライブラリに反映します</p>
-          </section>
-
-          <section>
-            <h3 className="text-sm font-bold text-slate-500 mb-3 uppercase tracking-wider">外部データ取り込み</h3>
-            <label className="flex flex-col items-center justify-center w-full h-32 border-2 border-dashed border-slate-300 rounded-2xl cursor-pointer hover:bg-slate-50 transition-colors group">
-              <input type="file" accept=".csv" onChange={handleImportCSV} className="hidden" />
-              <span className="text-3xl mb-2 group-hover:scale-110 transition-transform">📥</span>
-              <span className="text-sm font-bold text-slate-600">CSVファイルをインポート</span>
-            </label>
-          </section>
-
-          <section className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <Button variant="outline" className="w-full" onClick={() => downloadCSV(toCSV(dbItems), `world_heritage_library_${new Date().toISOString().slice(0,10)}.csv`)}>
-              📤 ライブラリを保存(CSV)
-            </Button>
-            <Button variant="danger" className="w-full" onClick={() => confirm('全てのライブラリデータを削除しますか？') && setDbItems([])}>
-              🗑 ライブラリ全削除
-            </Button>
-          </section>
+        <div className="grid grid-cols-2 gap-4 mt-8 pt-8 border-t border-slate-100">
+          <Button variant="outline" onClick={() => downloadCSV(toCSV(dbItems), 'wh_export.csv')}>CSVで保存</Button>
+          <Button variant="danger" onClick={() => confirm('全削除しますか？') && setDbItems([])}>全削除</Button>
         </div>
-
-        <Button variant="secondary" className="w-full" onClick={() => setView('home')}>ホームに戻る</Button>
       </div>
+
+      <Button variant="secondary" className="w-full py-4" onClick={() => setView('home')}>ホームに戻る</Button>
     </div>
   );
 
   const renderPlay = () => {
-    const question = sessionItems[currentQIndex];
-    if (!question) return null;
-    const options = [question.option1, question.option2, question.option3, question.option4];
-    
+    const q = sessionItems[currentQIndex];
+    if (!q) return null;
+    const opts = [q.option1, q.option2, q.option3, q.option4];
+
     return (
-      <div className="max-w-2xl mx-auto animate-fade-in pb-20">
-        <div className="flex justify-between items-center mb-6">
-          <span className="bg-slate-800 text-white px-4 py-1.5 rounded-full text-xs font-bold">{question.level}</span>
+      <div className="max-w-2xl mx-auto py-10 px-4 animate-fade-in">
+        <div className="flex justify-between items-end mb-8">
+          <div>
+            <span className="bg-slate-800 text-white px-4 py-1 rounded-full text-[10px] font-black uppercase tracking-widest">{q.level}</span>
+            <div className="flex items-center gap-2 mt-2">
+              <span className="text-4xl font-black text-slate-800">{currentQIndex + 1}</span>
+              <span className="text-slate-300 font-bold">/ {sessionItems.length}</span>
+            </div>
+          </div>
           <div className="text-right">
-            <p className="text-xs font-bold text-slate-400 uppercase tracking-widest">Progress</p>
-            <p className="text-2xl font-black text-slate-800 font-mono">{currentQIndex + 1} / {sessionItems.length}</p>
+            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Correct Answers</span>
+            <p className="text-2xl font-black text-emerald-500">{score}</p>
           </div>
         </div>
 
-        <div className="bg-white p-8 md:p-12 rounded-[2rem] shadow-xl shadow-slate-200/50 mb-8 relative border border-slate-100">
-          {question.is_japan && (
-            <div className="absolute top-0 right-0 bg-red-50 text-red-600 px-5 py-2 rounded-bl-2xl text-[10px] font-black uppercase tracking-[0.2em]">
-              🇯🇵 Japan Heritage
-            </div>
+        <div className="bg-white p-10 rounded-[3rem] shadow-xl shadow-slate-200/50 border border-slate-100 mb-8 relative overflow-hidden">
+          {q.is_japan && (
+            <div className="absolute top-0 right-0 bg-red-50 text-red-500 px-6 py-2 rounded-bl-3xl text-[10px] font-black tracking-widest">JAPAN HERITAGE</div>
           )}
-          <h2 className="text-xl md:text-2xl font-bold leading-relaxed text-slate-800">{question.question}</h2>
+          <h2 className="text-2xl font-bold text-slate-800 leading-relaxed">{q.question}</h2>
         </div>
 
-        <div className="grid gap-3 mb-8">
-          {options.map((opt, i) => (
+        <div className="grid gap-4">
+          {opts.map((opt, i) => (
             <button 
-              key={i} 
-              onClick={() => { if(!showResult) { setSelectedOption(i); setShowResult(true); if(i === question.correct_idx) setScore(s => s+1); } }} 
-              className={`p-5 text-left rounded-2xl border-2 transition-all font-bold flex items-center gap-4 ${
+              key={i}
+              onClick={() => handleAnswer(i)}
+              disabled={showResult}
+              className={`p-6 text-left rounded-3xl border-2 font-bold transition-all flex items-center gap-4 ${
                 showResult 
-                  ? (i === question.correct_idx ? 'bg-emerald-50 border-emerald-500 text-emerald-900 scale-[1.02]' : (i === selectedOption ? 'bg-red-50 border-red-500 text-red-900' : 'opacity-40 border-slate-100')) 
-                  : 'bg-white border-slate-200 hover:border-blue-400 hover:bg-blue-50 shadow-sm active:scale-95'
+                ? (i === q.correct_idx ? 'bg-emerald-50 border-emerald-500 text-emerald-800 scale-[1.02]' : (i === selectedOption ? 'bg-red-50 border-red-500 text-red-800' : 'opacity-40 border-slate-100'))
+                : 'bg-white border-slate-200 hover:border-blue-400 hover:shadow-lg active:scale-95'
               }`}
             >
-              <span className={`w-8 h-8 rounded-lg flex items-center justify-center text-sm ${showResult && i === question.correct_idx ? 'bg-emerald-500 text-white' : 'bg-slate-100 text-slate-500'}`}>{i + 1}</span>
+              <span className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm ${showResult && i === q.correct_idx ? 'bg-emerald-500 text-white' : 'bg-slate-100 text-slate-400'}`}>{i + 1}</span>
               <span className="flex-1">{opt}</span>
             </button>
           ))}
         </div>
 
         {showResult && (
-          <div className="bg-white p-8 rounded-3xl border-l-8 border-blue-600 shadow-xl mb-8 animate-fade-in-up">
-            <div className="flex items-center gap-3 mb-6">
-               <span className="text-3xl">{selectedOption === question.correct_idx ? '✅' : '❌'}</span>
-               <h3 className={`text-xl font-black ${selectedOption === question.correct_idx ? 'text-emerald-600' : 'text-red-600'}`}>
-                 {selectedOption === question.correct_idx ? '正解です！' : '正解は ' + (question.correct_idx + 1)}
-               </h3>
-            </div>
-            <div className="space-y-4">
-              <p className="text-slate-700 leading-relaxed font-medium">{question.explanation}</p>
-              <div className="bg-blue-50 p-4 rounded-xl">
-                 <p className="text-xs font-black text-blue-600 mb-1 uppercase tracking-wider">Trivia</p>
-                 <p className="text-sm text-blue-800">{question.advanced_explanation}</p>
+          <div className="mt-8 animate-fade-in-up">
+            <div className="bg-white p-8 rounded-[2.5rem] border border-slate-100 shadow-lg mb-6">
+              <div className="flex items-center gap-3 mb-4">
+                <span className="text-3xl">{selectedOption === q.correct_idx ? '✨' : '🧐'}</span>
+                <h3 className={`text-xl font-black ${selectedOption === q.correct_idx ? 'text-emerald-600' : 'text-red-500'}`}>
+                  {selectedOption === q.correct_idx ? '正解です！' : '正解は ' + (q.correct_idx + 1) + ' 番でした'}
+                </h3>
               </div>
-              <div className="flex justify-end pt-2">
-                <a href={question.wiki_link} target="_blank" rel="noreferrer" className="text-xs font-bold text-slate-400 hover:text-blue-500 transition-colors flex items-center gap-1">
-                  詳しく見る (Wikipedia) ↗
-                </a>
+              <p className="text-slate-600 leading-relaxed mb-6">{q.explanation}</p>
+              <div className="bg-slate-50 p-6 rounded-2xl border border-slate-100">
+                <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">Advanced Knowledge</h4>
+                <p className="text-sm text-slate-500 leading-relaxed">{q.advanced_explanation}</p>
+                {q.wiki_link && (
+                  <a href={q.wiki_link} target="_blank" rel="noreferrer" className="inline-block mt-4 text-xs text-blue-500 font-bold hover:underline">Wikipediaで詳しく見る ↗</a>
+                )}
               </div>
             </div>
-            <Button className="mt-8 w-full py-4 text-xl" onClick={() => { 
-              if(currentQIndex < sessionItems.length - 1) { 
-                setCurrentQIndex(c => c+1); setShowResult(false); setSelectedOption(null); 
-              } else { 
-                alert(`学習完了！\n今回のスコア: ${score} / ${sessionItems.length}`); 
-                setView('home'); 
-              } 
-            }}>
-              {currentQIndex < sessionItems.length - 1 ? '次の問題へ 👉' : 'ホームに戻る 🏆'}
+            <Button className="w-full py-5 text-xl" onClick={nextQuestion}>
+              {currentQIndex === sessionItems.length - 1 ? '結果を見る' : '次の問題へ'}
             </Button>
           </div>
         )}
@@ -354,36 +356,84 @@ export default function App() {
     );
   };
 
-  return (
-    <div className="min-h-screen bg-slate-50 py-10 font-sans">
-      <div className="max-w-5xl mx-auto px-4">
-        <header className="mb-14 flex justify-between items-center">
-          <button onClick={() => setView('home')} className="flex items-center gap-3 group">
-            <span className="text-3xl bg-white w-12 h-12 flex items-center justify-center rounded-2xl shadow-sm border border-slate-100 group-hover:rotate-12 transition-transform">🏛</span>
-            <span className="text-xl font-black text-slate-800 tracking-tighter">WH Master</span>
-          </button>
-          <div className="flex gap-2">
-            <button onClick={() => setView('settings')} className="bg-white p-3 rounded-2xl border border-slate-200 shadow-sm hover:bg-slate-50 transition-colors">⚙️</button>
-          </div>
-        </header>
+  const renderResult = () => (
+    <div className="max-w-2xl mx-auto py-16 px-4 text-center animate-fade-in">
+      <div className="mb-12">
+        <p className="text-xs font-black text-blue-500 uppercase tracking-[0.3em] mb-4">Training Complete</p>
+        <h2 className="text-6xl font-black text-slate-800 mb-4">{score} <span className="text-2xl text-slate-400">/ {sessionItems.length}</span></h2>
+        <p className="text-slate-400 font-bold">正答率 {Math.round((score/sessionItems.length)*100)}%</p>
+      </div>
 
-        <main>
-          {view === 'home' && renderHome()}
-          {view === 'play' && renderPlay()}
-          {view === 'manage' && renderManage()}
-          {view === 'settings' && (
-            <div className="max-w-md mx-auto bg-white p-10 rounded-[2.5rem] shadow-sm border border-slate-100">
-              <h2 className="text-2xl font-black mb-6 text-slate-800">APIキー設定</h2>
-              <p className="text-xs text-slate-400 mb-6 leading-relaxed">AIによる問題作成にはGemini APIキーが必要です。入力されたキーはブラウザのローカルストレージにのみ保存されます。</p>
-              <input type="text" value={tempKeyInput} onChange={e => setTempKeyInput(e.target.value)} className="w-full p-4 border-2 border-slate-100 rounded-2xl mb-6 font-mono text-sm focus:border-blue-500 outline-none transition-colors" placeholder="AIza..." />
-              <div className="flex gap-3">
-                <Button className="flex-1" onClick={handleSaveApiKey}>保存して戻る</Button>
-                <Button variant="secondary" onClick={() => setView('home')}>キャンセル</Button>
+      <div className="bg-white rounded-[3rem] border border-slate-200 shadow-sm overflow-hidden mb-8">
+        <div className="p-6 bg-slate-50 border-b border-slate-200 text-left font-bold text-slate-500 text-xs">今回の復習</div>
+        <div className="divide-y divide-slate-100 max-h-96 overflow-y-auto">
+          {quizResults.map((r, i) => (
+            <div key={i} className="p-5 text-left flex gap-4 items-start">
+              <span className={`w-6 h-6 rounded-full flex-shrink-0 flex items-center justify-center text-[10px] font-bold ${r.isCorrect ? 'bg-emerald-100 text-emerald-600' : 'bg-red-100 text-red-600'}`}>
+                {r.isCorrect ? '✓' : '×'}
+              </span>
+              <div>
+                <p className="text-sm font-bold text-slate-700 mb-1">{r.item.question}</p>
+                <p className="text-[10px] text-slate-400">正解: {r.item[`option${r.item.correct_idx + 1}` as keyof QuizItem]}</p>
               </div>
             </div>
-          )}
-        </main>
+          ))}
+        </div>
       </div>
+
+      <div className="grid grid-cols-2 gap-4">
+        <Button variant="primary" className="py-4" onClick={() => startLibraryStudy(sessionItems[0].level as QuizLevel)}>もう一度挑戦</Button>
+        <Button variant="secondary" className="py-4" onClick={() => setView('home')}>ホームへ</Button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen bg-slate-50 safe-area-pt safe-area-pb">
+      <nav className="fixed bottom-0 left-0 right-0 bg-white/80 backdrop-blur-md border-t border-slate-200 z-50 md:top-0 md:bottom-auto md:border-t-0 md:border-b">
+        <div className="max-w-4xl mx-auto px-6 h-16 flex justify-around md:justify-end md:gap-8 items-center">
+          <button onClick={() => setView('home')} className={`flex flex-col md:flex-row items-center gap-1 font-bold text-xs ${view === 'home' ? 'text-blue-600' : 'text-slate-400'}`}>
+            <span>🏠</span>
+            <span>ホーム</span>
+          </button>
+          <button onClick={() => setView('manage')} className={`flex flex-col md:flex-row items-center gap-1 font-bold text-xs ${view === 'manage' ? 'text-blue-600' : 'text-slate-400'}`}>
+            <span>📂</span>
+            <span>データ</span>
+          </button>
+          <button onClick={() => setView('settings')} className={`flex flex-col md:flex-row items-center gap-1 font-bold text-xs ${view === 'settings' ? 'text-blue-600' : 'text-slate-400'}`}>
+            <span>⚙️</span>
+            <span>設定</span>
+          </button>
+        </div>
+      </nav>
+
+      <main className="pt-6 pb-24 md:pt-24 md:pb-12">
+        {view === 'home' && renderHome()}
+        {view === 'play' && renderPlay()}
+        {view === 'manage' && renderManage()}
+        {view === 'result' && renderResult()}
+        {view === 'settings' && (
+          <div className="max-w-xl mx-auto py-10 px-4 animate-fade-in-up">
+            <div className="bg-white p-8 rounded-[2rem] border border-slate-200 shadow-sm">
+              <h2 className="text-2xl font-black mb-6">アプリ設定</h2>
+              <div className="space-y-4">
+                <label className="block text-sm font-bold text-slate-500">Gemini AI API Key (生成用)</label>
+                <input 
+                  type="password" 
+                  value={apiKey}
+                  onChange={e => {
+                    const v = e.target.value;
+                    setApiKey(v);
+                    localStorage.setItem('gemini_user_api_key', v);
+                  }}
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:border-blue-400"
+                />
+              </div>
+            </div>
+            <Button variant="secondary" className="w-full mt-8" onClick={() => setView('home')}>完了</Button>
+          </div>
+        )}
+      </main>
     </div>
   );
 }
