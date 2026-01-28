@@ -1,3 +1,4 @@
+
 export enum QuizLevel {
   LEVEL_3 = '3級',
   LEVEL_2 = '2級',
@@ -6,14 +7,14 @@ export enum QuizLevel {
 }
 
 export interface QuizItem {
-  id: string; // Internal ID for React keys
+  id: string;
   level: QuizLevel | string;
   question: string;
   option1: string;
   option2: string;
   option3: string;
   option4: string;
-  correct_idx: number; // 0-3
+  correct_idx: number;
   explanation: string;
   advanced_explanation: string;
   wiki_link: string;
@@ -23,5 +24,13 @@ export interface QuizItem {
 export interface GeneratorConfig {
   level: QuizLevel;
   count: number;
-  focusTopic?: string; // Optional: e.g., "European Cathedrals"
+  focusTopic?: string;
+}
+
+export interface GithubSyncConfig {
+  token: string;
+  owner: string;
+  repo: string;
+  path: string;
+  branch: string;
 }

@@ -1,11 +1,11 @@
 
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { QuizItem, QuizLevel, GeneratorConfig } from './types';
+import { QuizItem, QuizLevel, GeneratorConfig, GithubSyncConfig } from './types';
 import { generateQuizBatch } from './geminiService';
-import { parseCSV, toCSV, downloadCSV, downloadJson, isDuplicate, shuffleArray, generateId } from './utils';
+import { parseCSV, downloadJson, isDuplicate, shuffleArray, generateId } from './utils';
 import { PRESET_QUIZ_DATA } from './presets';
 
-const Button: React.FC<React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: 'primary' | 'secondary' | 'danger' | 'success' | 'outline' | 'ghost' }> = ({ 
+const Button: React.FC<React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: 'primary' | 'secondary' | 'danger' | 'success' | 'outline' | 'ghost' | 'github' }> = ({ 
   children, variant = 'primary', className = '', ...props 
 }) => {
   const base = "px-4 py-3 rounded-xl font-bold transition-all duration-200 active:scale-95 disabled:opacity-50 shadow-sm flex items-center justify-center gap-2 text-sm";
@@ -16,6 +16,7 @@ const Button: React.FC<React.ButtonHTMLAttributes<HTMLButtonElement> & { variant
     success: "bg-emerald-600 text-white hover:bg-emerald-700",
     outline: "bg-white text-slate-600 border-2 border-slate-200 hover:border-blue-400",
     ghost: "text-slate-500 hover:bg-slate-100 shadow-none",
+    github: "bg-slate-900 text-white hover:bg-black",
   };
   return <button className={`${base} ${variants[variant]} ${className}`} {...props}>{children}</button>;
 };
@@ -23,125 +24,59 @@ const Button: React.FC<React.ButtonHTMLAttributes<HTMLButtonElement> & { variant
 export default function App() {
   const [dbItems, setDbItems] = useState<QuizItem[]>([]);
   const [isInitializing, setIsInitializing] = useState(true);
-  const [isSyncing, setIsSyncing] = useState(false);
+  const [isBusy, setIsBusy] = useState(false);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('gemini_user_api_key') || '');
   const [view, setView] = useState<'home' | 'play' | 'manage' | 'settings' | 'result'>('home');
   const [studyCount, setStudyCount] = useState(10);
   const [sessionItems, setSessionItems] = useState<QuizItem[]>([]);
   
+  // Quiz Session State
   const [currentQIndex, setCurrentQIndex] = useState(0);
   const [selectedOption, setSelectedOption] = useState<number | null>(null);
   const [showResult, setShowResult] = useState(false);
   const [score, setScore] = useState(0);
-  const [quizResults, setQuizResults] = useState<{item: QuizItem, selected: number, isCorrect: boolean}[]>([]);
 
-  const [searchQuery, setSearchQuery] = useState('');
+  // Management State
   const [bulkInput, setBulkInput] = useState('');
-  const [remoteUrl, setRemoteUrl] = useState(() => localStorage.getItem('wh_remote_url') || './questions.json');
+  const [genLevel, setGenLevel] = useState<QuizLevel>(QuizLevel.LEVEL_3);
+  const [genCount, setGenCount] = useState(5);
+  const [genTopic, setGenTopic] = useState('');
   
+  // GitHub Config
+  const [ghConfig, setGhConfig] = useState<GithubSyncConfig>(() => {
+    const saved = localStorage.getItem('gh_sync_config');
+    return saved ? JSON.parse(saved) : { token: '', owner: '', repo: '', path: 'questions.json', branch: 'main' };
+  });
+
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    const initData = async () => {
-      const saved = localStorage.getItem('wh_quiz_data');
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (parsed.length > 0) {
-          setDbItems(parsed);
-          setIsInitializing(false);
-          return;
-        }
-      }
-      // データがない場合のみ初回同期
-      await handleFetchRemoteJson(remoteUrl, true);
-    };
-    initData();
+    const saved = localStorage.getItem('wh_quiz_data');
+    if (saved) {
+      setDbItems(JSON.parse(saved));
+    } else {
+      setDbItems(PRESET_QUIZ_DATA);
+    }
+    setIsInitializing(false);
   }, []);
 
   useEffect(() => {
     if (!isInitializing) {
       localStorage.setItem('wh_quiz_data', JSON.stringify(dbItems));
-      localStorage.setItem('wh_remote_url', remoteUrl);
+      localStorage.setItem('gh_sync_config', JSON.stringify(ghConfig));
     }
-  }, [dbItems, remoteUrl, isInitializing]);
+  }, [dbItems, ghConfig, isInitializing]);
 
-  const filteredItems = useMemo(() => {
-    if (!searchQuery) return dbItems;
-    const q = searchQuery.toLowerCase();
-    return dbItems.filter(item => 
-      item.question.toLowerCase().includes(q) || 
-      item.explanation.toLowerCase().includes(q)
-    );
-  }, [dbItems, searchQuery]);
+  // --- Functions ---
 
-  // GitHubの通常のURLをRAW URLに変換するユーティリティ
-  const normalizeGithubUrl = (url: string) => {
-    if (url.includes('github.com') && !url.includes('raw.githubusercontent.com')) {
-      return url
-        .replace('github.com', 'raw.githubusercontent.com')
-        .replace('/blob/', '/');
-    }
-    return url;
-  };
-
-  const handleFetchRemoteJson = async (url: string = remoteUrl, isInitial: boolean = false) => {
-    const targetUrl = normalizeGithubUrl(url.trim());
-    if (!targetUrl) return;
-
-    setIsSyncing(true);
-    try {
-      const cacheBuster = `?t=${new Date().getTime()}`;
-      const fullUrl = targetUrl.startsWith('http') ? (targetUrl + (targetUrl.includes('?') ? '&' : '') + cacheBuster) : targetUrl;
-      
-      const res = await fetch(fullUrl);
-      if (!res.ok) throw new Error(`HTTP Error: ${res.status}`);
-      const data = await res.json();
-      
-      if (Array.isArray(data)) {
-        const formatted = data.map(i => ({...i, id: i.id || generateId()}));
-        
-        if (isInitial) {
-          setDbItems(formatted);
-        } else {
-          // 強制上書きモード
-          if (confirm(`外部から ${formatted.length} 問取得しました。現在のリストを破棄して完全に置き換えますか？\n（「キャンセル」で未登録分のみ追加します）`)) {
-            setDbItems(formatted);
-            alert(`最新の ${formatted.length} 問に完全に置き換えました。`);
-          } else {
-            const unique = formatted.filter(n => !isDuplicate(n.question, dbItems));
-            setDbItems(prev => [...prev, ...unique]);
-            alert(`${unique.length} 問の新しい問題を追加しました。`);
-          }
-        }
-      }
-    } catch (e) {
-      console.error("Fetch failed:", e);
-      if (isInitial) {
-        setDbItems(PRESET_QUIZ_DATA);
-      } else {
-        alert('同期に失敗しました。\n・URLが正しいか（GitHubならRaw URLか）\n・インターネット接続\nを確認してください。');
-      }
-    } finally {
-      setIsSyncing(false);
-      setIsInitializing(false);
-    }
-  };
-
-  const processCsvText = (text: string) => {
-    const parsed = parseCSV(text);
-    if (parsed.length === 0) {
-      alert("CSV形式が正しくありません。");
+  const handleImport = (items: QuizItem[]) => {
+    const unique = items.filter(n => !isDuplicate(n.question, dbItems));
+    if (unique.length === 0) {
+      alert("新しい問題は見つかりませんでした（すべて重複しています）。");
       return;
     }
-    const unique = parsed.filter(n => !isDuplicate(n.question, dbItems));
     setDbItems(prev => [...prev, ...unique]);
-    alert(`${unique.length}問を追加しました。`);
-  };
-
-  const handleBulkImport = () => {
-    if (!bulkInput.trim()) return;
-    processCsvText(bulkInput);
-    setBulkInput('');
+    alert(`${unique.length}問を新しく追加しました。`);
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -150,97 +85,136 @@ export default function App() {
     const reader = new FileReader();
     reader.onload = (event) => {
       const text = event.target?.result as string;
-      if (text) processCsvText(text);
+      handleImport(parseCSV(text));
       if (fileInputRef.current) fileInputRef.current.value = '';
     };
     reader.readAsText(file);
   };
 
-  const startLibraryStudy = (level: QuizLevel) => {
-    const levelItems = dbItems.filter(i => i.level === level);
-    if (levelItems.length === 0) {
-      alert("このレベルの問題がありません。");
-      return;
-    }
-    const shuffled = shuffleArray(levelItems);
-    setSessionItems(shuffled.slice(0, studyCount));
-    setCurrentQIndex(0);
-    setScore(0);
-    setQuizResults([]);
-    setSelectedOption(null);
-    setShowResult(false);
-    setView('play');
-  };
-
-  const handleAnswer = (idx: number) => {
-    if (showResult) return;
-    setSelectedOption(idx);
-    setShowResult(true);
-    const item = sessionItems[currentQIndex];
-    const isCorrect = idx === item.correct_idx;
-    if (isCorrect) setScore(s => s + 1);
-    setQuizResults(prev => [...prev, { item, selected: idx, isCorrect }]);
-  };
-
-  const nextQuestion = () => {
-    if (currentQIndex < sessionItems.length - 1) {
-      setCurrentQIndex(c => c + 1);
-      setSelectedOption(null);
-      setShowResult(false);
-    } else {
-      setView('result');
+  const handleGenerateAI = async () => {
+    if (!apiKey) { alert("APIキーを設定してください。"); return; }
+    setIsBusy(true);
+    try {
+      const newItems = await generateQuizBatch({ level: genLevel, count: genCount, focusTopic: genTopic }, apiKey);
+      handleImport(newItems);
+    } catch (e) {
+      alert("AI生成に失敗しました。");
+    } finally {
+      setIsBusy(false);
     }
   };
 
-  if (isInitializing) return (
-    <div className="min-h-screen flex items-center justify-center bg-slate-50">
-      <div className="text-center space-y-4">
-        <div className="animate-spin h-12 w-12 border-4 border-blue-600 border-t-transparent rounded-full mx-auto"></div>
-        <p className="text-xs font-bold text-slate-400 animate-pulse">Syncing library...</p>
-      </div>
-    </div>
-  );
+  const syncFromGithub = async () => {
+    if (!ghConfig.owner || !ghConfig.repo) { alert("GitHubリポジトリ情報を設定してください。"); return; }
+    setIsBusy(true);
+    try {
+      const cacheBuster = `?t=${Date.now()}`;
+      const url = `https://raw.githubusercontent.com/${ghConfig.owner}/${ghConfig.repo}/${ghConfig.branch}/${ghConfig.path}${cacheBuster}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error("Fetch failed");
+      const data = await res.json();
+      if (Array.isArray(data)) {
+        if (confirm(`GitHubから ${data.length} 問取得しました。現在のリスト (${dbItems.length}問) をこれに置き換えますか？`)) {
+          setDbItems(data);
+          alert("同期完了しました。");
+        }
+      }
+    } catch (e) {
+      alert("GitHubからの取得に失敗しました。リポジトリ設定やファイルパスを確認してください。");
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const pushToGithub = async () => {
+    const { token, owner, repo, path, branch } = ghConfig;
+    if (!token || !owner || !repo) { alert("GitHub設定（トークン等）が不足しています。"); return; }
+    
+    setIsBusy(true);
+    try {
+      // 1. Get current remote file (to check size and get SHA)
+      const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
+      const headers = { 'Authorization': `token ${token}`, 'Accept': 'application/vnd.github.v3+json' };
+      
+      const getRes = await fetch(apiUrl + `?ref=${branch}`, { headers });
+      let sha = "";
+      if (getRes.ok) {
+        const remoteFile = await getRes.json();
+        sha = remoteFile.sha;
+        const remoteData = JSON.parse(atob(remoteFile.content));
+        
+        // --- ルール: 問題数が減る場合は上書きさせない ---
+        if (dbItems.length < remoteData.length) {
+          throw new Error(`リモートの問題数 (${remoteData.length}) がローカル (${dbItems.length}) より多いため、上書きできません。まず同期(取得)してください。`);
+        }
+      }
+
+      // 2. Commit (Push)
+      const body = {
+        message: `Update questions.json (count: ${dbItems.length})`,
+        content: btoa(unescape(encodeURIComponent(JSON.stringify(dbItems, null, 2)))),
+        branch,
+        sha: sha || undefined
+      };
+
+      const putRes = await fetch(apiUrl, {
+        method: 'PUT',
+        headers,
+        body: JSON.stringify(body)
+      });
+
+      if (!putRes.ok) throw new Error("Push failed");
+      alert(`GitHubの ${path} を更新しました！ (全 ${dbItems.length} 問)`);
+
+    } catch (e: any) {
+      alert(`エラー: ${e.message}`);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  // --- Views ---
 
   const renderHome = () => (
     <div className="max-w-4xl mx-auto space-y-12 py-10 px-4 animate-fade-in">
       <div className="text-center space-y-4">
-        <h1 className="text-5xl font-black text-slate-800 tracking-tight">世界遺産検定 <span className="text-blue-600">Master</span></h1>
-        <p className="text-slate-500 font-bold bg-white inline-block px-4 py-1 rounded-full border border-slate-200 shadow-sm">
-          現在 <span className="text-blue-600">{dbItems.length}</span> 問 搭載中
+        <h1 className="text-5xl font-black text-slate-800 tracking-tight italic">WHC Master</h1>
+        <p className="text-slate-500 font-bold bg-white inline-block px-6 py-2 rounded-full border border-slate-200 shadow-sm">
+          現在 <span className="text-blue-600 text-xl">{dbItems.length}</span> 問 搭載中
         </p>
       </div>
 
-      <div className="flex justify-center">
-        <div className="bg-white p-2 rounded-2xl shadow-sm border border-slate-200 flex gap-1">
-          {[10, 20, 30, 50, 100].map(c => (
-            <button key={c} onClick={() => setStudyCount(c)} className={`px-6 py-2 rounded-xl text-sm font-bold transition-all ${studyCount === c ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-500 hover:bg-slate-50'}`}>{c}問</button>
-          ))}
-        </div>
+      <div className="flex justify-center gap-2">
+        {[10, 20, 30, 50, 100].map(c => (
+          <button key={c} onClick={() => setStudyCount(c)} className={`w-12 h-12 rounded-full text-xs font-black transition-all ${studyCount === c ? 'bg-blue-600 text-white shadow-lg scale-110' : 'bg-white text-slate-400 border hover:bg-slate-50'}`}>{c}</button>
+        ))}
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         {Object.values(QuizLevel).map((level) => {
           const count = dbItems.filter(i => i.level === level).length;
           return (
-            <div key={level} className="bg-white p-8 rounded-[2.5rem] shadow-sm border border-slate-200 hover:shadow-xl transition-all">
-              <div className="flex justify-between items-start mb-6">
-                <div>
-                  <h3 className="text-3xl font-black text-slate-800">{level}</h3>
-                  <p className="text-xs font-bold text-blue-500 mt-1 uppercase tracking-widest">Library Size</p>
-                </div>
+            <div key={level} className="bg-white p-8 rounded-[2.5rem] shadow-sm border border-slate-200 hover:shadow-xl transition-all group">
+              <div className="flex justify-between items-center mb-6">
+                <h3 className="text-3xl font-black text-slate-800">{level}</h3>
                 <div className="text-right">
-                  <span className="text-4xl font-black text-slate-700">{count}</span>
-                  <span className="text-sm font-bold text-slate-400 ml-1">問</span>
+                  <span className="text-3xl font-black text-blue-600">{count}</span>
+                  <span className="text-xs font-bold text-slate-400 ml-1">ITEMS</span>
                 </div>
               </div>
-              <Button className="w-full py-4 text-lg rounded-2xl" onClick={() => startLibraryStudy(level as QuizLevel)} disabled={count === 0}>学習を開始</Button>
+              <Button className="w-full py-4 text-lg rounded-2xl" onClick={() => {
+                const levelItems = dbItems.filter(i => i.level === level);
+                const shuffled = shuffleArray(levelItems);
+                setSessionItems(shuffled.slice(0, studyCount));
+                setCurrentQIndex(0); setScore(0); setSelectedOption(null); setShowResult(false); setView('play');
+              }} disabled={count === 0}>Start Training</Button>
             </div>
           );
         })}
       </div>
 
-      <div className="flex justify-center gap-4 pt-10 border-t border-slate-200">
-        <Button variant="outline" onClick={() => setView('manage')}>📂 データ管理・同期</Button>
+      <div className="flex justify-center gap-4 pt-10 border-t">
+        <Button variant="outline" onClick={() => setView('manage')}>📂 データハブ (管理・同期)</Button>
         <Button variant="ghost" onClick={() => setView('settings')}>⚙️ 設定</Button>
       </div>
     </div>
@@ -248,63 +222,71 @@ export default function App() {
 
   const renderManage = () => (
     <div className="max-w-4xl mx-auto space-y-8 py-10 px-4 animate-fade-in-up">
-      <div className="bg-white p-8 rounded-[2rem] border border-slate-200 shadow-sm relative overflow-hidden">
-        {isSyncing && <div className="absolute inset-0 bg-white/60 backdrop-blur-sm flex items-center justify-center z-10 font-bold text-blue-600">同期中...</div>}
-        <h2 className="text-2xl font-black mb-6">🌐 外部データの強制同期</h2>
-        <p className="text-xs text-slate-500 mb-6 leading-relaxed">
-          GitHubなどでJSONを更新したのに反映されない場合は、以下にURLを貼り付けて「強制同期」してください。<br/>
-          <span className="text-red-500 font-bold">※GitHubの場合は、ファイル画面の「Raw」ボタンから取得できるURLを使用してください。</span>
-        </p>
-        <div className="space-y-4">
-          <input 
-            type="text" 
-            placeholder="questions.json のURL" 
-            value={remoteUrl} 
-            onChange={e => setRemoteUrl(e.target.value)} 
-            className="w-full px-4 py-4 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:border-blue-400 text-xs font-mono" 
-          />
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <Button variant="primary" className="py-4" onClick={() => handleFetchRemoteJson(remoteUrl)} disabled={isSyncing}>
-              {isSyncing ? '取得中...' : '最新状態に更新 (強制同期)'}
-            </Button>
-            <Button variant="outline" className="py-4" onClick={() => { localStorage.removeItem('wh_quiz_data'); window.location.reload(); }}>
-              キャッシュ破棄して再起動
-            </Button>
+      {isBusy && <div className="fixed inset-0 bg-white/80 backdrop-blur-sm flex items-center justify-center z-[100] font-black text-blue-600 italic text-2xl animate-pulse">PROCESSING...</div>}
+      
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        {/* Section 1 & 2: Import */}
+        <div className="bg-white p-8 rounded-[2.5rem] border shadow-sm space-y-6">
+          <h2 className="text-xl font-black flex items-center gap-2">📥 外部データの取り込み <span className="text-[10px] bg-slate-100 px-2 py-1 rounded text-slate-400">①②</span></h2>
+          <div className="space-y-3">
+            <Button variant="outline" className="w-full" onClick={() => fileInputRef.current?.click()}>CSVファイルを選択</Button>
+            <input type="file" accept=".csv" className="hidden" ref={fileInputRef} onChange={handleFileChange} />
+            <div className="relative">
+              <textarea className="w-full h-32 p-4 bg-slate-50 border rounded-2xl font-mono text-[10px] outline-none focus:ring-2 focus:ring-blue-400" placeholder="CSV形式のテキストを貼り付け..." value={bulkInput} onChange={e => setBulkInput(e.target.value)} />
+              <Button variant="secondary" className="absolute bottom-2 right-2 scale-75" onClick={() => { handleImport(parseCSV(bulkInput)); setBulkInput(''); }} disabled={!bulkInput.trim()}>追加</Button>
+            </div>
+          </div>
+        </div>
+
+        {/* Section 3: AI Generate */}
+        <div className="bg-white p-8 rounded-[2.5rem] border shadow-sm space-y-6">
+          <h2 className="text-xl font-black flex items-center gap-2">🤖 AIで問題を増やす <span className="text-[10px] bg-slate-100 px-2 py-1 rounded text-slate-400">③</span></h2>
+          <div className="space-y-4">
+            <div className="grid grid-cols-2 gap-2">
+              <select value={genLevel} onChange={e => setGenLevel(e.target.value as QuizLevel)} className="p-3 bg-slate-50 border rounded-xl font-bold">
+                {Object.values(QuizLevel).map(l => <option key={l} value={l}>{l}</option>)}
+              </select>
+              <select value={genCount} onChange={e => setGenCount(Number(e.target.value))} className="p-3 bg-slate-50 border rounded-xl font-bold">
+                {[5, 10, 20].map(c => <option key={c} value={c}>{c}問生成</option>)}
+              </select>
+            </div>
+            <input type="text" placeholder="テーマ (例: 日本の自然遺産, 建築)" value={genTopic} onChange={e => setGenTopic(e.target.value)} className="w-full p-3 bg-slate-50 border rounded-xl outline-none focus:ring-2 focus:ring-blue-400 font-bold" />
+            <Button variant="primary" className="w-full py-4" onClick={handleGenerateAI} disabled={!apiKey}>生成して保存</Button>
           </div>
         </div>
       </div>
 
-      <div className="bg-white p-8 rounded-[2rem] border border-slate-200 shadow-sm">
-        <h2 className="text-2xl font-black mb-2">📥 データの直接追加</h2>
-        <p className="text-xs text-slate-500 mb-6">CSVファイルやテキストから新しい問題を即座に追加できます。</p>
-        <div className="space-y-4">
-          <Button variant="outline" className="w-full py-4" onClick={() => fileInputRef.current?.click()}>CSVファイルを選択して読み込む</Button>
-          <input type="file" accept=".csv" className="hidden" ref={fileInputRef} onChange={handleFileChange} />
-          <textarea className="w-full h-24 p-4 bg-slate-50 border border-slate-200 rounded-2xl font-mono text-[10px] outline-none focus:border-blue-400" placeholder="レベル,問題文,選択肢1... (CSV形式テキストを貼り付け)" value={bulkInput} onChange={e => setBulkInput(e.target.value)} />
-          <Button variant="secondary" className="w-full" onClick={handleBulkImport} disabled={!bulkInput.trim()}>テキストから読み込む</Button>
+      {/* Section 4: GitHub Sync */}
+      <div className="bg-slate-900 text-white p-8 rounded-[2.5rem] shadow-xl space-y-6">
+        <h2 className="text-xl font-black flex items-center gap-2">🌐 GitHub 連携 <span className="text-[10px] bg-white/10 px-2 py-1 rounded text-white/40">④</span></h2>
+        <p className="text-xs text-white/60 leading-relaxed">設定済みのリポジトリへ直接保存します。<strong>ローカルの問題数がリモートより多い場合のみ</strong>上書き可能です。</p>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <Button variant="github" className="border border-white/20 py-4" onClick={syncFromGithub}>GitHubから取得 (同期)</Button>
+          <Button variant="success" className="py-4 shadow-lg shadow-emerald-900/20" onClick={pushToGithub}>GitHubへ上書き保存</Button>
+        </div>
+        <div className="pt-4 border-t border-white/10 flex justify-between items-center">
+          <p className="text-[10px] font-mono text-white/40">Repo: {ghConfig.owner}/{ghConfig.repo}</p>
+          <Button variant="ghost" className="text-white/40 hover:text-white" onClick={() => setView('settings')}>設定を変更</Button>
         </div>
       </div>
 
-      <div className="bg-white p-8 rounded-[2rem] border border-slate-200 shadow-sm">
+      <div className="bg-white p-8 rounded-[2.5rem] border shadow-sm">
         <div className="flex justify-between items-center mb-6">
-          <h2 className="text-xl font-black">全データ ({dbItems.length} 問)</h2>
-          <input type="text" placeholder="検索..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} className="px-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-sm outline-none focus:border-blue-400" />
+          <h2 className="text-xl font-black">データ閲覧 ({dbItems.length})</h2>
+          <Button variant="danger" className="scale-75" onClick={() => confirm('全て削除しますか？') && setDbItems([])}>全消去</Button>
         </div>
-        <div className="max-h-60 overflow-y-auto divide-y divide-slate-100 mb-8 text-xs">
-          {filteredItems.length === 0 ? <p className="py-10 text-center text-slate-300">データがありません</p> : filteredItems.slice(0, 100).map(item => (
-            <div key={item.id} className="py-2 flex justify-between items-center group">
-              <span className="flex-1 line-clamp-1">{item.question}</span>
-              <button onClick={() => setDbItems(prev => prev.filter(i => i.id !== item.id))} className="text-red-400 px-2 opacity-0 group-hover:opacity-100">削除</button>
+        <div className="max-h-60 overflow-y-auto divide-y text-xs font-medium">
+          {dbItems.slice().reverse().slice(0, 50).map(item => (
+            <div key={item.id} className="py-3 flex justify-between items-center group">
+              <span className="flex-1 truncate pr-4 italic text-slate-500">{item.question}</span>
+              <span className="text-[10px] font-black bg-slate-100 px-2 py-1 rounded mr-4">{item.level}</span>
+              <button onClick={() => setDbItems(prev => prev.filter(i => i.id !== item.id))} className="text-red-400 opacity-0 group-hover:opacity-100">削除</button>
             </div>
           ))}
-          {filteredItems.length > 100 && <p className="text-center py-4 text-slate-400">他 {filteredItems.length - 100} 問あります</p>}
-        </div>
-        <div className="grid grid-cols-2 gap-4 border-t pt-6">
-          <Button variant="success" onClick={() => downloadJson(dbItems, 'questions.json')}>📥 JSONを保存</Button>
-          <Button variant="danger" onClick={() => confirm('全てのデータを消去しますか？') && setDbItems([])}>全データ消去</Button>
         </div>
       </div>
-      <Button variant="secondary" className="w-full py-4" onClick={() => setView('home')}>ホームに戻る</Button>
+
+      <Button variant="secondary" className="w-full py-4" onClick={() => setView('home')}>ホームへ戻る</Button>
     </div>
   );
 
@@ -314,61 +296,94 @@ export default function App() {
     const opts = [q.option1, q.option2, q.option3, q.option4];
     return (
       <div className="max-w-2xl mx-auto py-10 px-4 animate-fade-in">
-        <div className="flex justify-between items-end mb-8">
-          <div>
-            <span className="bg-slate-800 text-white px-4 py-1 rounded-full text-[10px] font-black">{q.level}</span>
-            <div className="flex items-center gap-2 mt-2">
-              <span className="text-4xl font-black">{currentQIndex + 1}</span>
-              <span className="text-slate-300">/ {sessionItems.length}</span>
-            </div>
+        <div className="flex justify-between items-center mb-8">
+          <span className="bg-slate-800 text-white px-4 py-1 rounded-full text-[10px] font-black tracking-tighter">{q.level}</span>
+          <div className="flex items-center gap-4">
+            <div className="text-2xl font-black text-slate-800">{currentQIndex + 1}<span className="text-slate-300 text-sm font-bold ml-1">/ {sessionItems.length}</span></div>
+            <div className="h-2 w-24 bg-slate-200 rounded-full overflow-hidden"><div className="h-full bg-blue-600 transition-all duration-500" style={{ width: `${((currentQIndex + 1) / sessionItems.length) * 100}%` }}></div></div>
           </div>
-          <p className="text-sm font-bold text-emerald-600">正解: {score}</p>
         </div>
-        <div className="bg-white p-10 rounded-[3rem] shadow-xl border border-slate-100 mb-8 relative">
-          {q.is_japan && <div className="absolute top-0 right-0 bg-red-50 text-red-500 px-6 py-2 rounded-bl-3xl text-[10px] font-black tracking-widest">JAPAN</div>}
-          <h2 className="text-2xl font-bold leading-relaxed">{q.question}</h2>
+        <div className="bg-white p-10 rounded-[3rem] shadow-xl border-b-8 border-slate-200 mb-8 relative overflow-hidden">
+          {q.is_japan && <div className="absolute top-0 right-0 bg-red-600 text-white px-6 py-2 rounded-bl-3xl text-[10px] font-black tracking-widest">JAPAN</div>}
+          <h2 className="text-2xl font-bold leading-relaxed text-slate-800">{q.question}</h2>
         </div>
-        <div className="grid gap-4">
+        <div className="grid gap-3">
           {opts.map((opt, i) => (
-            <button key={i} onClick={() => handleAnswer(i)} disabled={showResult} className={`p-6 text-left rounded-3xl border-2 font-bold transition-all ${showResult ? (i === q.correct_idx ? 'bg-emerald-50 border-emerald-500 text-emerald-800 scale-[1.02]' : (i === selectedOption ? 'bg-red-50 border-red-500 text-red-800' : 'opacity-40 border-slate-100')) : 'bg-white border-slate-200 hover:border-blue-400 hover:shadow-lg active:scale-95'}`}>
+            <button key={i} onClick={() => !showResult && (setSelectedOption(i), setShowResult(true), i === q.correct_idx && setScore(s => s+1))} disabled={showResult} className={`p-6 text-left rounded-2xl border-2 font-bold transition-all ${showResult ? (i === q.correct_idx ? 'bg-emerald-50 border-emerald-500 text-emerald-800' : (i === selectedOption ? 'bg-red-50 border-red-500 text-red-800' : 'opacity-40 border-slate-100')) : 'bg-white border-slate-200 hover:border-blue-400 hover:-translate-y-1'}`}>
               {opt}
             </button>
           ))}
         </div>
         {showResult && (
-          <div className="mt-8 animate-fade-in-up">
-            <div className="bg-white p-8 rounded-[2.5rem] shadow-lg mb-6 border border-slate-100">
-              <p className="text-slate-600 mb-4 font-medium leading-relaxed">{q.explanation}</p>
-              <div className="bg-slate-50 p-4 rounded-2xl text-xs text-slate-500 leading-relaxed mb-4">{q.advanced_explanation}</div>
-              <Button className="w-full py-4 text-lg" onClick={nextQuestion}>{currentQIndex === sessionItems.length - 1 ? '結果発表' : '次へ進む'}</Button>
-            </div>
+          <div className="mt-8 animate-fade-in-up bg-white p-8 rounded-[2.5rem] shadow-lg border border-slate-100">
+            <p className="text-slate-600 mb-6 font-bold leading-relaxed">{q.explanation}</p>
+            <div className="bg-slate-50 p-6 rounded-2xl text-xs text-slate-500 leading-relaxed mb-6 italic border-l-4 border-blue-400">{q.advanced_explanation}</div>
+            <Button className="w-full py-4 text-lg" onClick={() => {
+              if (currentQIndex < sessionItems.length - 1) { setCurrentQIndex(c => c+1); setSelectedOption(null); setShowResult(false); } 
+              else { setView('result'); }
+            }}>{currentQIndex === sessionItems.length - 1 ? '結果を見る' : '次の問題へ'}</Button>
           </div>
         )}
       </div>
     );
   };
 
-  const renderResult = () => (
-    <div className="max-w-2xl mx-auto py-16 px-4 text-center animate-fade-in">
-      <div className="mb-12">
-        <h2 className="text-7xl font-black text-slate-800 mb-4">{score} <span className="text-2xl text-slate-400">/ {sessionItems.length}</span></h2>
-        <p className="text-slate-400 font-bold uppercase tracking-widest">Result Summary</p>
-      </div>
-      <div className="grid grid-cols-2 gap-4">
-        <Button variant="primary" className="py-4" onClick={() => startLibraryStudy(sessionItems[0].level as QuizLevel)}>もう一度解く</Button>
-        <Button variant="secondary" className="py-4" onClick={() => setView('home')}>ホームへ</Button>
+  const renderSettings = () => (
+    <div className="max-w-xl mx-auto py-10 px-4 space-y-6">
+      <div className="bg-white p-8 rounded-[2.5rem] border shadow-sm space-y-8">
+        <h2 className="text-2xl font-black">⚙️ 設定</h2>
+        
+        <div className="space-y-4">
+          <label className="text-xs font-black text-slate-400 uppercase tracking-widest block">Gemini API Key</label>
+          <input type="password" value={apiKey} onChange={e => {setApiKey(e.target.value); localStorage.setItem('gemini_user_api_key', e.target.value);}} className="w-full p-4 bg-slate-50 border rounded-xl outline-none focus:ring-2 focus:ring-blue-400 font-mono text-sm" placeholder="AI生成に必要です" />
+        </div>
+
+        <div className="space-y-4 pt-6 border-t">
+          <label className="text-xs font-black text-slate-400 uppercase tracking-widest block">GitHub Sync Settings</label>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="col-span-2">
+              <input type="password" placeholder="GitHub Personal Access Token" value={ghConfig.token} onChange={e => setGhConfig({...ghConfig, token: e.target.value})} className="w-full p-4 bg-slate-50 border rounded-xl outline-none focus:ring-2 focus:ring-slate-900 font-mono text-sm" />
+            </div>
+            <input type="text" placeholder="Owner (User)" value={ghConfig.owner} onChange={e => setGhConfig({...ghConfig, owner: e.target.value})} className="p-4 bg-slate-50 border rounded-xl outline-none text-sm font-bold" />
+            <input type="text" placeholder="Repo Name" value={ghConfig.repo} onChange={e => setGhConfig({...ghConfig, repo: e.target.value})} className="p-4 bg-slate-50 border rounded-xl outline-none text-sm font-bold" />
+            <input type="text" placeholder="Path (json)" value={ghConfig.path} onChange={e => setGhConfig({...ghConfig, path: e.target.value})} className="p-4 bg-slate-50 border rounded-xl outline-none text-sm font-bold" />
+            <input type="text" placeholder="Branch" value={ghConfig.branch} onChange={e => setGhConfig({...ghConfig, branch: e.target.value})} className="p-4 bg-slate-50 border rounded-xl outline-none text-sm font-bold" />
+          </div>
+        </div>
+
+        <Button className="w-full py-4" onClick={() => setView('home')}>設定を完了</Button>
       </div>
     </div>
   );
 
   return (
-    <div className="min-h-screen bg-slate-50">
-      <nav className="fixed bottom-0 left-0 right-0 bg-white/80 backdrop-blur-md border-t h-16 flex justify-around items-center z-50 md:top-0 md:bottom-auto md:border-b">
-        <button onClick={() => setView('home')} className={`font-bold text-xs flex flex-col items-center gap-1 ${view === 'home' ? 'text-blue-600' : 'text-slate-400'}`}><span>🏠</span><span>ホーム</span></button>
-        <button onClick={() => setView('manage')} className={`font-bold text-xs flex flex-col items-center gap-1 ${view === 'manage' ? 'text-blue-600' : 'text-slate-400'}`}><span>📂</span><span>データ</span></button>
-        <button onClick={() => setView('settings')} className={`font-bold text-xs flex flex-col items-center gap-1 ${view === 'settings' ? 'text-blue-600' : 'text-slate-400'}`}><span>⚙️</span><span>設定</span></button>
+    <div className="min-h-screen bg-slate-50 text-slate-900 pb-20">
+      <nav className="fixed bottom-0 left-0 right-0 bg-white/90 backdrop-blur-xl border-t h-20 flex justify-around items-center z-50 md:top-0 md:bottom-auto md:border-b shadow-2xl md:shadow-none">
+        <button onClick={() => setView('home')} className={`w-1/4 h-full font-black text-[10px] flex flex-col items-center justify-center gap-1 uppercase tracking-tighter transition-all ${view === 'home' ? 'text-blue-600 scale-110' : 'text-slate-300 hover:text-slate-500'}`}>🏠<span>HOME</span></button>
+        <button onClick={() => setView('manage')} className={`w-1/4 h-full font-black text-[10px] flex flex-col items-center justify-center gap-1 uppercase tracking-tighter transition-all ${view === 'manage' ? 'text-blue-600 scale-110' : 'text-slate-300 hover:text-slate-500'}`}>📂<span>DATA</span></button>
+        <button onClick={() => setView('settings')} className={`w-1/4 h-full font-black text-[10px] flex flex-col items-center justify-center gap-1 uppercase tracking-tighter transition-all ${view === 'settings' ? 'text-blue-600 scale-110' : 'text-slate-300 hover:text-slate-500'}`}>⚙️<span>SETUP</span></button>
       </nav>
-      <main className="pt-6 pb-24 md:pt-24">{view === 'home' && renderHome()}{view === 'play' && renderPlay()}{view === 'manage' && renderManage()}{view === 'result' && renderResult()}{view === 'settings' && <div className="max-w-xl mx-auto py-10 px-4"><div className="bg-white p-8 rounded-[2rem] border shadow-sm"><h2 className="text-xl font-black mb-6">設定</h2><label className="text-xs font-bold text-slate-400 mb-2 block">Gemini APIキー</label><input type="password" value={apiKey} onChange={e => {setApiKey(e.target.value); localStorage.setItem('gemini_user_api_key', e.target.value);}} className="w-full p-3 bg-slate-50 border rounded-xl mb-6 outline-none focus:border-blue-400" /><Button className="w-full" onClick={() => setView('home')}>完了</Button></div></div>}</main>
+      <main className="pt-6 md:pt-24">
+        {view === 'home' && renderHome()}
+        {view === 'play' && renderPlay()}
+        {view === 'manage' && renderManage()}
+        {view === 'settings' && renderSettings()}
+        {view === 'result' && (
+          <div className="max-w-2xl mx-auto py-20 px-4 text-center animate-fade-in space-y-12">
+            <div className="space-y-4">
+              <h2 className="text-8xl font-black text-slate-800">{Math.round((score/sessionItems.length)*100)}<span className="text-3xl text-slate-300 ml-2">%</span></h2>
+              <p className="text-slate-400 font-black tracking-[0.5em] uppercase">Training Complete</p>
+            </div>
+            <div className="bg-white p-8 rounded-[3rem] border shadow-sm">
+              <p className="text-slate-500 font-bold mb-4">{sessionItems.length}問中 {score}問正解</p>
+              <div className="grid grid-cols-2 gap-4">
+                <Button className="py-4" onClick={() => setView('home')}>ホームへ戻る</Button>
+                <Button variant="secondary" className="py-4" onClick={() => { setCurrentQIndex(0); setScore(0); setSelectedOption(null); setShowResult(false); setView('play'); }}>もう一度解く</Button>
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
     </div>
   );
 }
