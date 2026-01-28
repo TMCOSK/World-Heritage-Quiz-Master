@@ -38,6 +38,8 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [bulkInput, setBulkInput] = useState('');
   const [remoteUrl, setRemoteUrl] = useState(() => localStorage.getItem('wh_remote_url') || './questions.json');
+  
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const initData = async () => {
@@ -96,17 +98,37 @@ export default function App() {
     }
   };
 
-  const handleBulkImport = () => {
-    if (!bulkInput.trim()) return;
-    const parsed = parseCSV(bulkInput);
+  const processCsvText = (text: string) => {
+    const parsed = parseCSV(text);
     if (parsed.length === 0) {
-      alert("CSV形式が正しくありません。");
+      alert("CSV形式が正しくありません。ヘッダー（level,question...）を確認してください。");
       return;
     }
     const unique = parsed.filter(n => !isDuplicate(n.question, dbItems));
     setDbItems(prev => [...prev, ...unique]);
+    alert(`${unique.length}問を追加しました。`);
+  };
+
+  const handleBulkImport = () => {
+    if (!bulkInput.trim()) return;
+    processCsvText(bulkInput);
     setBulkInput('');
-    alert(`${unique.length}問を追加しました。これをGitHubに反映するには、下の「JSONを保存」ボタンで書き出してアップロードしてください。`);
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const text = event.target?.result as string;
+      if (text) {
+        processCsvText(text);
+      }
+      // Reset input
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    };
+    reader.readAsText(file);
   };
 
   const startLibraryStudy = (level: QuizLevel) => {
@@ -197,18 +219,44 @@ export default function App() {
   const renderManage = () => (
     <div className="max-w-4xl mx-auto space-y-8 py-10 px-4 animate-fade-in-up">
       <div className="bg-white p-8 rounded-[2rem] border border-slate-200 shadow-sm">
-        <h2 className="text-2xl font-black mb-6">📥 300問一括インポート</h2>
-        <p className="text-xs text-slate-500 mb-4">
-          Excel等のデータをCSV形式（カンマ区切り）で貼り付けてください。<br/>
-          形式: レベル,問題,選択肢1,選択肢2,選択肢3,選択肢4,正解(0-3),解説,詳細,Wiki,日本(TRUE/FALSE)
+        <h2 className="text-2xl font-black mb-2 flex items-center gap-2">📥 300問一括インポート</h2>
+        <p className="text-xs text-slate-500 mb-6">
+          CSVファイルを選択するか、Excel等からコピーしたデータを貼り付けてください。
         </p>
-        <textarea 
-          className="w-full h-40 p-4 bg-slate-50 border border-slate-200 rounded-2xl font-mono text-xs mb-4 outline-none focus:border-blue-400"
-          placeholder="3級,問題文,選択肢1,選択肢2,選択肢3,選択肢4,0,解説文,詳細文,http://...,TRUE"
-          value={bulkInput}
-          onChange={e => setBulkInput(e.target.value)}
-        />
-        <Button variant="success" className="w-full" onClick={handleBulkImport}>一括追加実行</Button>
+        
+        <div className="space-y-6">
+          <div className="p-6 bg-slate-50 rounded-2xl border-2 border-dashed border-slate-200 flex flex-col items-center justify-center gap-3">
+            <span className="text-3xl">📄</span>
+            <p className="text-sm font-bold text-slate-600">CSVファイルを直接読み込む</p>
+            <input 
+              type="file" 
+              accept=".csv" 
+              className="hidden" 
+              ref={fileInputRef} 
+              onChange={handleFileChange}
+            />
+            <Button variant="primary" onClick={() => fileInputRef.current?.click()}>
+              ファイルを選択
+            </Button>
+          </div>
+
+          <div className="relative">
+            <div className="absolute inset-0 flex items-center"><span className="w-full border-t border-slate-200"></span></div>
+            <div className="relative flex justify-center text-xs uppercase"><span className="bg-white px-4 text-slate-400 font-bold tracking-widest">OR Paste Text</span></div>
+          </div>
+
+          <div>
+            <textarea 
+              className="w-full h-32 p-4 bg-slate-50 border border-slate-200 rounded-2xl font-mono text-[10px] mb-3 outline-none focus:border-blue-400"
+              placeholder="3級,問題文,選択肢1,選択肢2,選択肢3,選択肢4,0,解説文,詳細文,http://...,TRUE"
+              value={bulkInput}
+              onChange={e => setBulkInput(e.target.value)}
+            />
+            <Button variant="secondary" className="w-full" onClick={handleBulkImport} disabled={!bulkInput.trim()}>
+              テキストから追加
+            </Button>
+          </div>
+        </div>
       </div>
 
       <div className="bg-white p-8 rounded-[2rem] border border-slate-200 shadow-sm">
