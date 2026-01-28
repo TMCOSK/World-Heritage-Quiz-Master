@@ -1,3 +1,4 @@
+
 import { QuizItem } from './types';
 
 export const CSV_HEADER = "level,question,option1,option2,option3,option4,correct_idx,explanation,advanced_explanation,wiki_link,is_japan";
@@ -20,30 +21,21 @@ export const shuffleArray = <T>(array: T[]): T[] => {
   return newArray;
 };
 
-/**
- * Robust CSV parser that handles quoted strings and commas inside quotes.
- */
 export const parseCSV = (csvText: string): QuizItem[] => {
   const items: QuizItem[] = [];
   const lines = csvText.trim().split(/\r?\n/);
-  
-  // Skip header
   const startIndex = lines[0].toLowerCase().includes('level,question') ? 1 : 0;
 
   for (let i = startIndex; i < lines.length; i++) {
     const line = lines[i];
     if (!line.trim()) continue;
-
-    // Regex to split by comma but ignore commas inside double quotes
     const row: string[] = [];
     let curValue = "";
     let inQuotes = false;
-
     for (let j = 0; j < line.length; j++) {
       const char = line[j];
       if (char === '"') {
         if (inQuotes && line[j+1] === '"') {
-          // Handle escaped quotes ""
           curValue += '"';
           j++;
         } else {
@@ -57,7 +49,6 @@ export const parseCSV = (csvText: string): QuizItem[] => {
       }
     }
     row.push(curValue);
-
     if (row.length >= 11) {
       items.push({
         id: generateId(),
@@ -80,12 +71,10 @@ export const parseCSV = (csvText: string): QuizItem[] => {
 
 export const toCSV = (items: QuizItem[]): string => {
   const rows = items.map(item => {
-    // Escape double quotes by doubling them and wrapping field in quotes
     const clean = (val: any) => {
       const str = String(val ?? "");
       return `"${str.replace(/"/g, '""')}"`;
     };
-    
     return [
       clean(item.level),
       clean(item.question),
@@ -100,12 +89,25 @@ export const toCSV = (items: QuizItem[]): string => {
       item.is_japan ? 'TRUE' : 'FALSE'
     ].join(',');
   });
-
   return [CSV_HEADER, ...rows].join('\n');
 };
 
 export const downloadCSV = (content: string, filename: string) => {
   const blob = new Blob([new Uint8Array([0xEF, 0xBB, 0xBF]), content], { type: 'text/csv;charset=utf-8;' });
+  const link = document.createElement('a');
+  if (link.download !== undefined) {
+    const url = URL.createObjectURL(blob);
+    link.setAttribute('href', url);
+    link.setAttribute('download', filename);
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+};
+
+export const downloadJson = (data: any, filename: string) => {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
   const link = document.createElement('a');
   if (link.download !== undefined) {
     const url = URL.createObjectURL(blob);
