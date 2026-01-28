@@ -41,19 +41,19 @@ export default function App() {
   
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // 初期化時に保存データを読み込み。データが空ならリモートから取得
   useEffect(() => {
     const initData = async () => {
       const saved = localStorage.getItem('wh_quiz_data');
-      let currentItems: QuizItem[] = saved ? JSON.parse(saved) : [];
-
-      if (currentItems.length === 0) {
-        // 初回起動時や全削除後はリモートから読み込み
-        await handleFetchRemoteJson(remoteUrl, true);
-      } else {
-        setDbItems(currentItems);
-        setIsInitializing(false);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed.length > 0) {
+          setDbItems(parsed);
+          setIsInitializing(false);
+          return;
+        }
       }
+      // データがない場合のみ初回同期
+      await handleFetchRemoteJson(remoteUrl, true);
     };
     initData();
   }, []);
@@ -74,14 +74,27 @@ export default function App() {
     );
   }, [dbItems, searchQuery]);
 
+  // GitHubの通常のURLをRAW URLに変換するユーティリティ
+  const normalizeGithubUrl = (url: string) => {
+    if (url.includes('github.com') && !url.includes('raw.githubusercontent.com')) {
+      return url
+        .replace('github.com', 'raw.githubusercontent.com')
+        .replace('/blob/', '/');
+    }
+    return url;
+  };
+
   const handleFetchRemoteJson = async (url: string = remoteUrl, isInitial: boolean = false) => {
-    if (!url.trim()) return;
+    const targetUrl = normalizeGithubUrl(url.trim());
+    if (!targetUrl) return;
+
     setIsSyncing(true);
     try {
-      // キャッシュを避けるためにタイムスタンプを付与
       const cacheBuster = `?t=${new Date().getTime()}`;
-      const res = await fetch(url + (url.includes('?') ? '&' : '') + cacheBuster);
-      if (!res.ok) throw new Error();
+      const fullUrl = targetUrl.startsWith('http') ? (targetUrl + (targetUrl.includes('?') ? '&' : '') + cacheBuster) : targetUrl;
+      
+      const res = await fetch(fullUrl);
+      if (!res.ok) throw new Error(`HTTP Error: ${res.status}`);
       const data = await res.json();
       
       if (Array.isArray(data)) {
@@ -90,21 +103,24 @@ export default function App() {
         if (isInitial) {
           setDbItems(formatted);
         } else {
-          // 重複していないものだけ追加するか、あるいは完全に置き換えるか選択可能にする
-          if (confirm(`最新のデータから${formatted.length}問見つかりました。現在のリストに統合しますか？\n（「キャンセル」で現在のリストを破棄して最新版に完全入れ替えします）`)) {
+          // 強制上書きモード
+          if (confirm(`外部から ${formatted.length} 問取得しました。現在のリストを破棄して完全に置き換えますか？\n（「キャンセル」で未登録分のみ追加します）`)) {
+            setDbItems(formatted);
+            alert(`最新の ${formatted.length} 問に完全に置き換えました。`);
+          } else {
             const unique = formatted.filter(n => !isDuplicate(n.question, dbItems));
             setDbItems(prev => [...prev, ...unique]);
-            alert(`${unique.length}問の新規問題を追加しました。`);
-          } else {
-            setDbItems(formatted);
-            alert(`最新の${formatted.length}問に更新しました。`);
+            alert(`${unique.length} 問の新しい問題を追加しました。`);
           }
         }
       }
     } catch (e) {
-      console.error(e);
-      if (isInitial) setDbItems(PRESET_QUIZ_DATA);
-      else alert('データの同期に失敗しました。URLを確認してください。');
+      console.error("Fetch failed:", e);
+      if (isInitial) {
+        setDbItems(PRESET_QUIZ_DATA);
+      } else {
+        alert('同期に失敗しました。\n・URLが正しいか（GitHubならRaw URLか）\n・インターネット接続\nを確認してください。');
+      }
     } finally {
       setIsSyncing(false);
       setIsInitializing(false);
@@ -180,7 +196,7 @@ export default function App() {
     <div className="min-h-screen flex items-center justify-center bg-slate-50">
       <div className="text-center space-y-4">
         <div className="animate-spin h-12 w-12 border-4 border-blue-600 border-t-transparent rounded-full mx-auto"></div>
-        <p className="text-xs font-bold text-slate-400">Loading library...</p>
+        <p className="text-xs font-bold text-slate-400 animate-pulse">Syncing library...</p>
       </div>
     </div>
   );
@@ -189,7 +205,9 @@ export default function App() {
     <div className="max-w-4xl mx-auto space-y-12 py-10 px-4 animate-fade-in">
       <div className="text-center space-y-4">
         <h1 className="text-5xl font-black text-slate-800 tracking-tight">世界遺産検定 <span className="text-blue-600">Master</span></h1>
-        <p className="text-slate-400 font-medium">合計 {dbItems.length} 問のライブラリ</p>
+        <p className="text-slate-500 font-bold bg-white inline-block px-4 py-1 rounded-full border border-slate-200 shadow-sm">
+          現在 <span className="text-blue-600">{dbItems.length}</span> 問 搭載中
+        </p>
       </div>
 
       <div className="flex justify-center">
@@ -208,7 +226,7 @@ export default function App() {
               <div className="flex justify-between items-start mb-6">
                 <div>
                   <h3 className="text-3xl font-black text-slate-800">{level}</h3>
-                  <p className="text-xs font-bold text-blue-500 mt-1 uppercase tracking-widest">Available Items</p>
+                  <p className="text-xs font-bold text-blue-500 mt-1 uppercase tracking-widest">Library Size</p>
                 </div>
                 <div className="text-right">
                   <span className="text-4xl font-black text-slate-700">{count}</span>
@@ -222,7 +240,7 @@ export default function App() {
       </div>
 
       <div className="flex justify-center gap-4 pt-10 border-t border-slate-200">
-        <Button variant="outline" onClick={() => setView('manage')}>📂 データ管理</Button>
+        <Button variant="outline" onClick={() => setView('manage')}>📂 データ管理・同期</Button>
         <Button variant="ghost" onClick={() => setView('settings')}>⚙️ 設定</Button>
       </div>
     </div>
@@ -231,17 +249,28 @@ export default function App() {
   const renderManage = () => (
     <div className="max-w-4xl mx-auto space-y-8 py-10 px-4 animate-fade-in-up">
       <div className="bg-white p-8 rounded-[2rem] border border-slate-200 shadow-sm relative overflow-hidden">
-        {isSyncing && <div className="absolute inset-0 bg-white/60 backdrop-blur-sm flex items-center justify-center z-10 font-bold">同期中...</div>}
-        <h2 className="text-2xl font-black mb-6">🌐 GitHub / 外部データ同期</h2>
-        <p className="text-xs text-slate-500 mb-4 leading-relaxed">
-          GitHubにアップロードした JSON が反映されない場合は、下の「最新状態に更新」ボタンを押してください。<br/>
-          ブラウザのキャッシュを無視して、最新のファイルを強制的に取得します。
+        {isSyncing && <div className="absolute inset-0 bg-white/60 backdrop-blur-sm flex items-center justify-center z-10 font-bold text-blue-600">同期中...</div>}
+        <h2 className="text-2xl font-black mb-6">🌐 外部データの強制同期</h2>
+        <p className="text-xs text-slate-500 mb-6 leading-relaxed">
+          GitHubなどでJSONを更新したのに反映されない場合は、以下にURLを貼り付けて「強制同期」してください。<br/>
+          <span className="text-red-500 font-bold">※GitHubの場合は、ファイル画面の「Raw」ボタンから取得できるURLを使用してください。</span>
         </p>
-        <div className="flex flex-col gap-3">
-          <input type="text" placeholder="questions.json のURL" value={remoteUrl} onChange={e => setRemoteUrl(e.target.value)} className="flex-1 px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:border-blue-400 text-xs font-mono" />
-          <Button variant="primary" className="w-full py-4" onClick={() => handleFetchRemoteJson(remoteUrl)} disabled={isSyncing}>
-            {isSyncing ? '取得中...' : '最新状態に更新 (強制同期)'}
-          </Button>
+        <div className="space-y-4">
+          <input 
+            type="text" 
+            placeholder="questions.json のURL" 
+            value={remoteUrl} 
+            onChange={e => setRemoteUrl(e.target.value)} 
+            className="w-full px-4 py-4 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:border-blue-400 text-xs font-mono" 
+          />
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <Button variant="primary" className="py-4" onClick={() => handleFetchRemoteJson(remoteUrl)} disabled={isSyncing}>
+              {isSyncing ? '取得中...' : '最新状態に更新 (強制同期)'}
+            </Button>
+            <Button variant="outline" className="py-4" onClick={() => { localStorage.removeItem('wh_quiz_data'); window.location.reload(); }}>
+              キャッシュ破棄して再起動
+            </Button>
+          </div>
         </div>
       </div>
 
@@ -268,9 +297,10 @@ export default function App() {
               <button onClick={() => setDbItems(prev => prev.filter(i => i.id !== item.id))} className="text-red-400 px-2 opacity-0 group-hover:opacity-100">削除</button>
             </div>
           ))}
+          {filteredItems.length > 100 && <p className="text-center py-4 text-slate-400">他 {filteredItems.length - 100} 問あります</p>}
         </div>
         <div className="grid grid-cols-2 gap-4 border-t pt-6">
-          <Button variant="success" onClick={() => downloadJson(dbItems, 'questions.json')}>📥 JSONを保存 (バックアップ)</Button>
+          <Button variant="success" onClick={() => downloadJson(dbItems, 'questions.json')}>📥 JSONを保存</Button>
           <Button variant="danger" onClick={() => confirm('全てのデータを消去しますか？') && setDbItems([])}>全データ消去</Button>
         </div>
       </div>
