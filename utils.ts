@@ -6,14 +6,11 @@ export const generateId = (): string => {
   return Math.random().toString(36).substring(2, 9);
 };
 
-// Check if a question text already exists in the current items
 export const isDuplicate = (newQuestion: string, existingItems: QuizItem[]): boolean => {
-  // Normalize string for comparison (trim spaces)
   const normalizedNew = newQuestion.trim();
   return existingItems.some(item => item.question.trim() === normalizedNew);
 };
 
-// Fisher-Yates shuffle algorithm
 export const shuffleArray = <T>(array: T[]): T[] => {
   const newArray = [...array];
   for (let i = newArray.length - 1; i > 0; i--) {
@@ -23,33 +20,58 @@ export const shuffleArray = <T>(array: T[]): T[] => {
   return newArray;
 };
 
+/**
+ * Robust CSV parser that handles quoted strings and commas inside quotes.
+ */
 export const parseCSV = (csvText: string): QuizItem[] => {
-  const lines = csvText.trim().split('\n');
   const items: QuizItem[] = [];
+  const lines = csvText.trim().split(/\r?\n/);
   
-  // Skip header if present
-  const startIndex = lines[0].startsWith('level,question') ? 1 : 0;
+  // Skip header
+  const startIndex = lines[0].toLowerCase().includes('level,question') ? 1 : 0;
 
   for (let i = startIndex; i < lines.length; i++) {
-    // Simple CSV parser handling standard comma separation. 
-    // Note: This basic parser assumes no commas inside the fields for simplicity. 
-    
-    const row = lines[i].split(','); 
-    
+    const line = lines[i];
+    if (!line.trim()) continue;
+
+    // Regex to split by comma but ignore commas inside double quotes
+    const row: string[] = [];
+    let curValue = "";
+    let inQuotes = false;
+
+    for (let j = 0; j < line.length; j++) {
+      const char = line[j];
+      if (char === '"') {
+        if (inQuotes && line[j+1] === '"') {
+          // Handle escaped quotes ""
+          curValue += '"';
+          j++;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (char === ',' && !inQuotes) {
+        row.push(curValue);
+        curValue = "";
+      } else {
+        curValue += char;
+      }
+    }
+    row.push(curValue);
+
     if (row.length >= 11) {
       items.push({
         id: generateId(),
-        level: row[0],
-        question: row[1],
-        option1: row[2],
-        option2: row[3],
-        option3: row[4],
-        option4: row[5],
-        correct_idx: parseInt(row[6], 10),
-        explanation: row[7],
-        advanced_explanation: row[8],
-        wiki_link: row[9],
-        is_japan: row[10].toUpperCase() === 'TRUE',
+        level: row[0].trim(),
+        question: row[1].trim(),
+        option1: row[2].trim(),
+        option2: row[3].trim(),
+        option3: row[4].trim(),
+        option4: row[5].trim(),
+        correct_idx: parseInt(row[6], 10) || 0,
+        explanation: row[7].trim(),
+        advanced_explanation: row[8].trim(),
+        wiki_link: row[9].trim(),
+        is_japan: row[10].trim().toUpperCase() === 'TRUE',
       });
     }
   }
@@ -58,11 +80,14 @@ export const parseCSV = (csvText: string): QuizItem[] => {
 
 export const toCSV = (items: QuizItem[]): string => {
   const rows = items.map(item => {
-    // Escape commas in text fields if necessary (simplified)
-    const clean = (str: string) => `"${str.replace(/"/g, '""')}"`;
+    // Escape double quotes by doubling them and wrapping field in quotes
+    const clean = (val: any) => {
+      const str = String(val ?? "");
+      return `"${str.replace(/"/g, '""')}"`;
+    };
     
     return [
-      item.level,
+      clean(item.level),
       clean(item.question),
       clean(item.option1),
       clean(item.option2),
@@ -71,7 +96,7 @@ export const toCSV = (items: QuizItem[]): string => {
       item.correct_idx,
       clean(item.explanation),
       clean(item.advanced_explanation),
-      item.wiki_link,
+      clean(item.wiki_link),
       item.is_japan ? 'TRUE' : 'FALSE'
     ].join(',');
   });
@@ -80,7 +105,7 @@ export const toCSV = (items: QuizItem[]): string => {
 };
 
 export const downloadCSV = (content: string, filename: string) => {
-  const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
+  const blob = new Blob([new Uint8Array([0xEF, 0xBB, 0xBF]), content], { type: 'text/csv;charset=utf-8;' });
   const link = document.createElement('a');
   if (link.download !== undefined) {
     const url = URL.createObjectURL(blob);
